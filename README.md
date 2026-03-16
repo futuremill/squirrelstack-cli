@@ -64,6 +64,13 @@ squirrelstack errors members
 | `SQUIRRELSTACK_TOKEN` | PAT token (overrides Keychain) |
 | `SQUIRRELSTACK_URL` | API base URL (default: `https://squirrelstack.app`) |
 
+## Releasing
+
+1. Bump `VERSION` in `squirrelstack`
+2. Commit and run `bin/release`
+
+This tags the release, creates a GitHub release, and updates the Homebrew formula automatically.
+
 ## License
 
 Proprietary. Copyright Future Mill Ltd.
