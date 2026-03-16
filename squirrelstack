@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="0.1.0"
+VERSION="0.1.1"
 KEYCHAIN_SERVICE="squirrelstack-cli"
 KEYCHAIN_ACCOUNT="pat"
 BASE_URL="${SQUIRRELSTACK_URL:-https://squirrelstack.app}"
@@ -232,10 +232,11 @@ cmd_errors_list() {
     severity_icons = { "critical" => "!!!", "error" => "!! ", "warning" => "!  ", "info" => "   " }
     priority_icons = { "critical" => "P0", "high" => "P1", "medium" => "P2", "low" => "P3" }
 
-    printf "%-4s  %-4s  %-8s  %5s  %-15s  %-35s  %-25s  %s\n", "SEV", "PRI", "ENV", "COUNT", "ASSIGNEE", "TYPE", "MESSAGE", "LAST SEEN"
-    printf "%s\n", "-" * 130
+    printf "%-8s  %-4s  %-4s  %-8s  %5s  %-15s  %-35s  %-25s  %s\n", "ID", "SEV", "PRI", "ENV", "COUNT", "ASSIGNEE", "TYPE", "MESSAGE", "LAST SEEN"
+    printf "%s\n", "-" * 140
 
     errors.each do |e|
+      id = e["id"].to_s
       sev = severity_icons[e["severity"]] || "   "
       pri = priority_icons[e["priority"]] || "--"
       env = (e["environment"] || "")[0..7]
@@ -245,7 +246,7 @@ cmd_errors_list() {
       msg = e["message"].to_s[0..23]
       last_seen = e["last_seen_at"] ? Time.parse(e["last_seen_at"]).strftime("%Y-%m-%d %H:%M") : ""
 
-      printf "%-4s  %-4s  %-8s  %5s  %-15s  %-35s  %-25s  %s\n", sev, pri, env, count, assignee, type, msg, last_seen
+      printf "%-8s  %-4s  %-4s  %-8s  %5s  %-15s  %-35s  %-25s  %s\n", id, sev, pri, env, count, assignee, type, msg, last_seen
     end
 
     puts
