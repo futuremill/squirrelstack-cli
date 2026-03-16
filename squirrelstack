@@ -1,0 +1,506 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+VERSION="0.1.0"
+KEYCHAIN_SERVICE="squirrelstack-cli"
+KEYCHAIN_ACCOUNT="pat"
+BASE_URL="${SQUIRRELSTACK_URL:-https://squirrelstack.app}"
+CLIENT_NAME="SquirrelStack CLI"
+
+urlencode() { ruby -ruri -e 'print URI.encode_www_form_component(ARGV[0])' -- "$1"; }
+
+# --- Helpers ---
+
+die() { echo "Error: $1" >&2; exit 1; }
+
+keychain_get() {
+  security find-generic-password -s "$KEYCHAIN_SERVICE" -a "$KEYCHAIN_ACCOUNT" -w 2>/dev/null || echo ""
+}
+
+keychain_set() {
+  local token="$1"
+  security delete-generic-password -s "$KEYCHAIN_SERVICE" -a "$KEYCHAIN_ACCOUNT" 2>/dev/null || true
+  security add-generic-password -s "$KEYCHAIN_SERVICE" -a "$KEYCHAIN_ACCOUNT" -w "$token"
+}
+
+keychain_delete() {
+  security delete-generic-password -s "$KEYCHAIN_SERVICE" -a "$KEYCHAIN_ACCOUNT" 2>/dev/null || true
+}
+
+load_token() {
+  if [[ -n "${SQUIRRELSTACK_TOKEN:-}" ]]; then
+    TOKEN="$SQUIRRELSTACK_TOKEN"
+    return
+  fi
+
+  TOKEN=$(keychain_get)
+  if [[ -z "$TOKEN" ]]; then
+    echo "No token found. Let's set one up."
+    echo ""
+    echo "You can either:"
+    echo "  1. Log in via your browser (recommended)"
+    echo "  2. Paste an existing PAT"
+    echo ""
+    read -rp "Choose [1/2]: " choice
+
+    case "$choice" in
+      1) cmd_login ;;
+      2)
+        read -rsp "Paste your PAT (pat_...): " token
+        echo ""
+        [[ "$token" == pat_* ]] || die "Token must start with pat_"
+        keychain_set "$token"
+        echo "Token saved to Keychain."
+        ;;
+      *) die "Invalid choice." ;;
+    esac
+
+    TOKEN=$(keychain_get)
+    [[ -n "$TOKEN" ]] || die "Token setup failed."
+  fi
+}
+
+api_request() {
+  local method="$1"
+  local path="$2"
+  shift 2
+  local url="${BASE_URL}/api/v1${path}"
+
+  local response
+  response=$(curl -sS -w "\n%{http_code}" -X "$method" -H "Authorization: Bearer $TOKEN" "$url" "$@" 2>&1) || die "Request failed: $response"
+
+  local http_code body
+  http_code=$(echo "$response" | tail -1)
+  body=$(echo "$response" | sed '$d')
+
+  if [[ "$http_code" == "401" ]]; then
+    echo "Token is invalid or expired. Removing from Keychain." >&2
+    keychain_delete
+    die "Please run the command again to re-authenticate."
+  fi
+
+  if [[ "$http_code" -ge 400 ]]; then
+    die "API returned $http_code: $body"
+  fi
+
+  echo "$body"
+}
+
+api_get() { api_request GET "$@"; }
+
+api_patch() {
+  local path="$1"
+  shift
+  api_request PATCH "$path" -H "Content-Type: application/json" "$@"
+}
+
+api_post() {
+  local path="$1"
+  shift
+  api_request POST "$path" -H "Content-Type: application/json" "$@"
+}
+
+# --- PKCE OAuth Login ---
+
+generate_pkce() {
+  CODE_VERIFIER=$(openssl rand -base64 32 | tr -d '=/+' | head -c 43)
+  CODE_CHALLENGE=$(printf '%s' "$CODE_VERIFIER" | openssl dgst -sha256 -binary | openssl base64 -A | tr '+/' '-_' | tr -d '=')
+}
+
+cmd_login() {
+  generate_pkce
+
+  local state
+  state=$(openssl rand -hex 16)
+  local port=19283
+  local redirect_uri="http://127.0.0.1:${port}"
+
+  local encoded_name
+  encoded_name=$(urlencode "$CLIENT_NAME")
+  local auth_url="${BASE_URL}/auth/authorize?response_type=code&code_challenge=${CODE_CHALLENGE}&code_challenge_method=S256&redirect_uri=${redirect_uri}&state=${state}&client_name=${encoded_name}"
+
+  echo "Opening browser to authorize..."
+  open "$auth_url"
+  echo "Waiting for authorization callback on port ${port}..."
+
+  local callback_data
+  callback_data=$(ruby -e '
+    require "socket"
+    require "uri"
+
+    server = TCPServer.new("127.0.0.1", '"$port"')
+    server.setsockopt(Socket::SOL_SOCKET, Socket::SO_REUSEADDR, true)
+
+    ready = IO.select([server], nil, nil, 120)
+    unless ready
+      $stderr.puts "Timed out waiting for authorization."
+      server.close
+      exit 1
+    end
+
+    client = server.accept
+    request_line = client.gets
+    server.close
+
+    path = request_line.split(" ")[1]
+    params = URI.decode_www_form(URI(path).query || "").to_h
+
+    body = "<html><body><h1>Authorized!</h1><p>You can close this tab and return to your terminal.</p><script>window.close()</script></body></html>"
+    client.print "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: #{body.bytesize}\r\nConnection: close\r\n\r\n#{body}"
+    client.close
+
+    puts params["code"]
+    puts params["state"]
+  ') || die "Failed to receive authorization callback."
+
+  local auth_code callback_state
+  auth_code=$(echo "$callback_data" | head -1)
+  callback_state=$(echo "$callback_data" | tail -1)
+
+  [[ -n "$auth_code" ]] || die "No authorization code received."
+  [[ "$callback_state" == "$state" ]] || die "State mismatch — possible CSRF attack."
+
+  echo "Exchanging authorization code for token..."
+
+  local token_response
+  token_response=$(curl -sS -X POST "${BASE_URL}/auth/token" \
+    -H "Content-Type: application/x-www-form-urlencoded" \
+    -d "grant_type=authorization_code&code=${auth_code}&code_verifier=${CODE_VERIFIER}&redirect_uri=${redirect_uri}&client_name=${encoded_name}") || die "Token exchange failed."
+
+  local access_token
+  access_token=$(echo "$token_response" | ruby -rjson -rtime -e '
+    data = JSON.parse(STDIN.read)
+    if data["error"]
+      $stderr.puts "#{data["error"]}: #{data["error_description"]}"
+      exit 1
+    end
+    puts data["access_token"]
+  ') || die "Failed to parse token response."
+
+  [[ -n "$access_token" ]] || die "No access token received."
+
+  keychain_set "$access_token"
+  echo "Authenticated! Token saved to Keychain."
+}
+
+# --- Commands ---
+
+cmd_logout() {
+  keychain_delete
+  echo "Token removed from Keychain."
+}
+
+cmd_errors_list() {
+  load_token
+
+  local status="unresolved"
+  local severity=""
+  local environment=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --status)    status="$2"; shift 2 ;;
+      --severity)  severity="$2"; shift 2 ;;
+      --env)       environment="$2"; shift 2 ;;
+      --json)      JSON_OUTPUT=1; shift ;;
+      *)           die "Unknown option: $1" ;;
+    esac
+  done
+
+  local query="status=${status}"
+  [[ -n "$severity" ]] && query="${query}&severity=${severity}"
+  [[ -n "$environment" ]] && query="${query}&environment=${environment}"
+
+  local response
+  response=$(api_get "/errors?${query}")
+
+  if [[ "${JSON_OUTPUT:-}" == "1" ]]; then
+    echo "$response" | ruby -rjson -rtime -e 'puts JSON.pretty_generate(JSON.parse(STDIN.read))'
+    return
+  fi
+
+  local count
+  count=$(echo "$response" | ruby -rjson -rtime -e 'puts JSON.parse(STDIN.read)["errors"].length')
+
+  if [[ "$count" == "0" ]]; then
+    echo "No ${status} errors found."
+    return
+  fi
+
+  echo "$response" | ruby -rjson -rtime -e '
+    errors = JSON.parse(STDIN.read)["errors"]
+    severity_icons = { "critical" => "!!!", "error" => "!! ", "warning" => "!  ", "info" => "   " }
+    priority_icons = { "critical" => "P0", "high" => "P1", "medium" => "P2", "low" => "P3" }
+
+    printf "%-4s  %-4s  %-8s  %5s  %-15s  %-35s  %-25s  %s\n", "SEV", "PRI", "ENV", "COUNT", "ASSIGNEE", "TYPE", "MESSAGE", "LAST SEEN"
+    printf "%s\n", "-" * 130
+
+    errors.each do |e|
+      sev = severity_icons[e["severity"]] || "   "
+      pri = priority_icons[e["priority"]] || "--"
+      env = (e["environment"] || "")[0..7]
+      count = e["occurrences_count"].to_s
+      assignee = e.dig("assignee", "name").to_s[0..13]
+      type = e["error_type"].to_s[0..33]
+      msg = e["message"].to_s[0..23]
+      last_seen = e["last_seen_at"] ? Time.parse(e["last_seen_at"]).strftime("%Y-%m-%d %H:%M") : ""
+
+      printf "%-4s  %-4s  %-8s  %5s  %-15s  %-35s  %-25s  %s\n", sev, pri, env, count, assignee, type, msg, last_seen
+    end
+
+    puts
+    puts "#{errors.length} error(s). Use: squirrelstack errors show <ID> for details."
+  '
+}
+
+cmd_errors_show() {
+  load_token
+
+  local error_id="${1:-}"
+  [[ -n "$error_id" ]] || die "Usage: squirrelstack errors show <ID>"
+
+  local json_output="${2:-}"
+
+  local response
+  response=$(api_get "/errors/${error_id}")
+
+  if [[ "$json_output" == "--json" ]]; then
+    echo "$response" | ruby -rjson -rtime -e 'puts JSON.pretty_generate(JSON.parse(STDIN.read))'
+    return
+  fi
+
+  echo "$response" | ruby -rjson -rtime -e '
+    e = JSON.parse(STDIN.read)["error"]
+
+    puts "=" * 80
+    puts "#{e["error_type"]}"
+    puts "=" * 80
+    puts
+    puts "ID:           #{e["id"]}"
+    puts "Status:       #{e["status"]}"
+    puts "Severity:     #{e["severity"]}"
+    puts "Priority:     #{e["priority"] || "(not set)"}"
+    puts "Environment:  #{e["environment"]}"
+    puts "Occurrences:  #{e["occurrences_count"]}"
+    puts "Assignee:     #{e.dig("assignee", "name") || "(unassigned)"}"
+    puts "First seen:   #{e["first_seen_at"]}"
+    puts "Last seen:    #{e["last_seen_at"]}"
+    puts
+
+    if e["error_message"] && !e["error_message"].empty?
+      puts "MESSAGE"
+      puts "-" * 80
+      puts e["error_message"]
+      puts
+    end
+
+    location = [e["file"], e["line"]].compact.join(":")
+    controller = [e["component"], e["action"]].compact.join("#")
+    if !location.empty? || !controller.empty?
+      puts "LOCATION"
+      puts "-" * 80
+      puts location unless location.empty?
+      puts controller unless controller.empty?
+      puts
+    end
+
+    if e["backtrace"].is_a?(Array) && !e["backtrace"].empty?
+      puts "BACKTRACE"
+      puts "-" * 80
+      e["backtrace"].each do |frame|
+        file = frame["file"]
+        line = frame["line"]
+        func = frame["function"]
+        app_frame = file.to_s.include?("app/") && !file.to_s.include?("vendor/")
+        prefix = app_frame ? ">> " : "   "
+        puts "#{prefix}#{file}:#{line} in #{func}"
+      end
+      puts
+    end
+
+    occ = e["latest_occurrence"]
+    if occ
+      puts "LATEST OCCURRENCE"
+      puts "-" * 80
+      puts "Time:     #{occ["occurred_at"]}"
+      puts "Request:  #{occ["http_method"]} #{occ["url"]}" if occ["url"]
+      puts "Host:     #{occ["hostname"]}" if occ["hostname"]
+      puts "User:     #{occ["user_name"] || occ["user_id"]}" if occ["user_name"] || occ["user_id"]
+
+      if occ["context"].is_a?(Hash) && !occ["context"].empty?
+        puts
+        puts "Context:"
+        occ["context"].each { |k, v| puts "  #{k}: #{v}" }
+      end
+
+      if occ["params_data"].is_a?(Hash) && !occ["params_data"].empty?
+        puts
+        puts "Params:"
+        puts "  #{JSON.pretty_generate(occ["params_data"]).gsub("\n", "\n  ")}"
+      end
+
+      if occ["environment_data"].is_a?(Hash) && !occ["environment_data"].empty?
+        puts
+        puts "Environment:"
+        occ["environment_data"].each { |k, v| puts "  #{k}: #{v}" }
+      end
+    end
+
+    if e["notes"].is_a?(Array) && !e["notes"].empty?
+      puts
+      puts "NOTES"
+      puts "-" * 80
+      e["notes"].each do |n|
+        puts "  [#{n["created_at"]}] #{n["user"]}: #{n["body"]}"
+      end
+    end
+  '
+}
+
+cmd_errors_update() {
+  load_token
+
+  local error_id="${1:-}"
+  [[ -n "$error_id" ]] || die "Usage: squirrelstack errors update <ID> [--status ...] [--priority ...] [--assign ...]"
+  shift
+
+  local json_fields=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --status)
+        json_fields="${json_fields}\"status\":\"$2\","
+        shift 2 ;;
+      --priority)
+        if [[ "$2" == "none" ]]; then
+          json_fields="${json_fields}\"priority\":null,"
+        else
+          json_fields="${json_fields}\"priority\":\"$2\","
+        fi
+        shift 2 ;;
+      --assign)
+        if [[ "$2" == "none" ]]; then
+          json_fields="${json_fields}\"assignee_id\":null,"
+        else
+          json_fields="${json_fields}\"assignee_id\":$2,"
+        fi
+        shift 2 ;;
+      *)  die "Unknown option: $1" ;;
+    esac
+  done
+
+  [[ -n "$json_fields" ]] || die "No updates specified. Use --status, --priority, or --assign."
+
+  # Remove trailing comma
+  json_fields="${json_fields%,}"
+
+  local response
+  response=$(api_patch "/errors/${error_id}" -d "{${json_fields}}")
+
+  echo "$response" | ruby -rjson -rtime -e '
+    e = JSON.parse(STDIN.read)["error"]
+    puts "Updated error #{e["id"]}:"
+    puts "  Status:   #{e["status"]}"
+    puts "  Priority: #{e["priority"] || "(not set)"}"
+    puts "  Assignee: #{e.dig("assignee", "name") || "(unassigned)"}"
+  '
+}
+
+cmd_errors_comment() {
+  load_token
+
+  local error_id="${1:-}"
+  [[ -n "$error_id" ]] || die "Usage: squirrelstack errors comment <ID> <message>"
+  shift
+
+  local body="$*"
+  [[ -n "$body" ]] || die "Usage: squirrelstack errors comment <ID> <message>"
+
+  # JSON-escape the body
+  local json_body
+  json_body=$(ruby -rjson -rtime -e 'puts({ body: ARGV[0] }.to_json)' -- "$body")
+
+  local response
+  response=$(api_post "/errors/${error_id}/add_note" -d "$json_body")
+
+  echo "$response" | ruby -rjson -rtime -e '
+    n = JSON.parse(STDIN.read)["note"]
+    puts "Note added by #{n["user"]} at #{n["created_at"]}:"
+    puts "  #{n["body"]}"
+  '
+}
+
+cmd_errors_members() {
+  load_token
+
+  local response
+  response=$(api_get "/members")
+
+  echo "$response" | ruby -rjson -rtime -e '
+    members = JSON.parse(STDIN.read)["members"]
+    printf "%-8s  %s\n", "ID", "NAME"
+    printf "%s\n", "-" * 40
+    members.each do |m|
+      printf "%-8s  %s\n", m["id"], m["name"]
+    end
+  '
+}
+
+cmd_help() {
+  cat <<'HELP'
+squirrelstack — CLI for SquirrelStack
+
+Usage:
+  squirrelstack login                         Authenticate via browser (OAuth)
+  squirrelstack logout                        Remove token from Keychain
+  squirrelstack errors [options]              List open errors
+  squirrelstack errors show <ID>              Show error details with notes
+  squirrelstack errors update <ID> [options]  Update error status/priority/assignee
+  squirrelstack errors comment <ID> <message> Add a note to an error
+  squirrelstack errors members                List team members (for --assign)
+
+Options for 'errors':
+  --status <status>     Filter: unresolved (default), resolved, ignored, all
+  --severity <level>    Filter: critical, error, warning, info
+  --env <environment>   Filter by environment (e.g. production)
+  --json                Output raw JSON
+
+Options for 'errors update':
+  --status <status>     Set: unresolved, resolved, ignored, always_ignored
+  --priority <level>    Set: critical, high, medium, low, none
+  --assign <user_id>    Assign to user (use 'none' to unassign)
+
+Options for 'errors show':
+  --json                Output raw JSON
+
+Environment variables:
+  SQUIRRELSTACK_TOKEN   PAT token (overrides Keychain)
+  SQUIRRELSTACK_URL     API base URL (default: https://squirrelstack.app)
+
+Token is stored securely in macOS Keychain. On first use, you'll be
+prompted to log in or paste a PAT.
+HELP
+}
+
+# --- Main ---
+
+command="${1:-help}"
+shift || true
+
+case "$command" in
+  login)         cmd_login ;;
+  logout)        cmd_logout ;;
+  errors)
+    subcommand="${1:-list}"
+    case "$subcommand" in
+      show)    shift; cmd_errors_show "$@" ;;
+      update)  shift; cmd_errors_update "$@" ;;
+      comment) shift; cmd_errors_comment "$@" ;;
+      members) cmd_errors_members ;;
+      *)       cmd_errors_list "$@" ;;
+    esac
+    ;;
+  version|--version|-v) echo "squirrelstack $VERSION" ;;
+  help|--help|-h) cmd_help ;;
+  *)              die "Unknown command: $command. Run: squirrelstack help" ;;
+esac
