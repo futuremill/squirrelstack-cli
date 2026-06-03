@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="0.1.1"
+VERSION="0.2.0"
 KEYCHAIN_SERVICE="squirrelstack-cli"
 KEYCHAIN_ACCOUNT="pat"
 BASE_URL="${SQUIRRELSTACK_URL:-https://squirrelstack.app}"
 CLIENT_NAME="SquirrelStack CLI"
+
+# Account resolution. Populated by resolve_account(); used by api_request.
+ACCOUNT_SLUG=""
+ACCOUNT_SOURCE=""
+ACCOUNT_FLAG=""
 
 urlencode() { ruby -ruri -e 'print URI.encode_www_form_component(ARGV[0])' -- "$1"; }
 
@@ -60,14 +65,74 @@ load_token() {
   fi
 }
 
+# Reads the `account=` line from a `.squirrelstack` file. Returns empty on miss.
+read_account_from_file() {
+  local file="$1"
+  [[ -f "$file" ]] || { echo ""; return; }
+  grep -E "^account[[:space:]]*=" "$file" 2>/dev/null \
+    | head -1 \
+    | sed -E 's/^account[[:space:]]*=[[:space:]]*//' \
+    | tr -d '[:space:]'
+}
+
+# Resolution order:
+#   1. --account flag
+#   2. SQUIRRELSTACK_ACCOUNT env
+#   3. .squirrelstack walked up from cwd (stops at $HOME or /)
+#   4. ~/.squirrelstack
+#   5. Server default (only works when user has exactly one account)
+resolve_account() {
+  if [[ -n "$ACCOUNT_FLAG" ]]; then
+    ACCOUNT_SLUG="$ACCOUNT_FLAG"
+    ACCOUNT_SOURCE="--account flag"
+    return
+  fi
+
+  if [[ -n "${SQUIRRELSTACK_ACCOUNT:-}" ]]; then
+    ACCOUNT_SLUG="$SQUIRRELSTACK_ACCOUNT"
+    ACCOUNT_SOURCE="SQUIRRELSTACK_ACCOUNT env var"
+    return
+  fi
+
+  local dir="$PWD"
+  while [[ "$dir" != "/" ]]; do
+    local found
+    found=$(read_account_from_file "$dir/.squirrelstack")
+    if [[ -n "$found" ]]; then
+      ACCOUNT_SLUG="$found"
+      ACCOUNT_SOURCE="$dir/.squirrelstack"
+      return
+    fi
+    [[ "$dir" == "$HOME" ]] && break
+    dir=$(dirname "$dir")
+  done
+
+  local home_value
+  home_value=$(read_account_from_file "$HOME/.squirrelstack")
+  if [[ -n "$home_value" ]]; then
+    ACCOUNT_SLUG="$home_value"
+    ACCOUNT_SOURCE="$HOME/.squirrelstack"
+    return
+  fi
+
+  ACCOUNT_SLUG=""
+  ACCOUNT_SOURCE="server default"
+}
+
+# Sends an HTTP request. Includes X-Account-Slug when resolved.
 api_request() {
   local method="$1"
   local path="$2"
   shift 2
   local url="${BASE_URL}/api/v1${path}"
 
+  local -a headers=( -H "Authorization: Bearer $TOKEN" )
+  if [[ -n "$ACCOUNT_SLUG" ]]; then
+    headers+=( -H "X-Account-Slug: $ACCOUNT_SLUG" )
+  fi
+
   local response
-  response=$(curl -sS -w "\n%{http_code}" -X "$method" -H "Authorization: Bearer $TOKEN" "$url" "$@" 2>&1) || die "Request failed: $response"
+  response=$(curl -sS -w "\n%{http_code}" -X "$method" "${headers[@]}" "$url" "$@" 2>&1) || die "Request failed: $response"
 
   local http_code body
   http_code=$(echo "$response" | tail -1)
@@ -77,6 +142,31 @@ api_request() {
     echo "Token is invalid or expired. Removing from Keychain." >&2
     keychain_delete
     die "Please run the command again to re-authenticate."
+  fi
+
+  if [[ "$http_code" == "400" ]] && echo "$body" | grep -q "Account required"; then
+    local available
+    available=$(echo "$body" | ruby -rjson -e 'puts (JSON.parse(STDIN.read)["available_accounts"] || []).join(", ")' 2>/dev/null || echo "")
+    {
+      echo "Error: account required."
+      echo "Your user belongs to multiple accounts. Pick one with:"
+      echo "  squirrelstack --account <slug> ..."
+      echo "  squirrelstack accounts use <slug>"
+      echo "  export SQUIRRELSTACK_ACCOUNT=<slug>"
+      [[ -n "$available" ]] && echo "Available accounts: $available"
+    } >&2
+    exit 1
+  fi
+
+  if [[ "$http_code" == "403" ]] && echo "$body" | grep -q "inaccessible account"; then
+    local available
+    available=$(echo "$body" | ruby -rjson -e 'puts (JSON.parse(STDIN.read)["available_accounts"] || []).join(", ")' 2>/dev/null || echo "")
+    {
+      echo "Error: account '$ACCOUNT_SLUG' is not one of your accounts."
+      [[ -n "$available" ]] && echo "Available accounts: $available"
+      echo "(account selected via $ACCOUNT_SOURCE)"
+    } >&2
+    exit 1
   fi
 
   if [[ "$http_code" -ge 400 ]]; then
@@ -190,8 +280,107 @@ cmd_logout() {
   echo "Token removed from Keychain."
 }
 
+# Fetches /api/v1/me and prints accounts, marking the currently resolved one.
+cmd_accounts_list() {
+  load_token
+  resolve_account
+
+  local response
+  response=$(api_request GET "/me")
+
+  echo "$response" | ACCOUNT_SLUG="$ACCOUNT_SLUG" ACCOUNT_SOURCE="$ACCOUNT_SOURCE" ruby -rjson -e '
+    data = JSON.parse(STDIN.read)
+    current = ENV["ACCOUNT_SLUG"]
+    source = ENV["ACCOUNT_SOURCE"]
+    accounts = data["accounts"]
+
+    if accounts.empty?
+      puts "(no accounts)"
+      exit
+    end
+
+    printf "%-3s  %-25s  %s\n", "", "SLUG", "NAME"
+    accounts.each do |a|
+      marker = (a["slug"] == current) ? "*" : " "
+      printf "%-3s  %-25s  %s\n", marker, a["slug"], a["name"]
+    end
+
+    puts
+    if current.empty?
+      puts "Current: (none — using server default)"
+    else
+      puts "Current: #{current} (#{source})"
+    end
+  '
+}
+
+cmd_accounts_use() {
+  local slug="${1:-}"
+  [[ -n "$slug" ]] || die "Usage: squirrelstack accounts use <slug> [-g|--global]  or  squirrelstack accounts use --clear [-g|--global]"
+
+  local global=0
+  local clear=0
+
+  if [[ "$slug" == "--clear" ]]; then
+    clear=1
+  fi
+
+  case "${2:-}" in
+    -g|--global) global=1 ;;
+    "") ;;
+    *) die "Unknown option: ${2}" ;;
+  esac
+
+  local target
+  if [[ "$global" == "1" ]]; then
+    target="$HOME/.squirrelstack"
+  else
+    target="$PWD/.squirrelstack"
+  fi
+
+  if [[ "$clear" == "1" ]]; then
+    if [[ -f "$target" ]]; then
+      rm "$target"
+      echo "Removed $target"
+    else
+      echo "No config at $target"
+    fi
+    return
+  fi
+
+  # Validate the slug against the user's accounts before writing.
+  load_token
+  local response
+  response=$(api_request GET "/me")
+  local valid
+  valid=$(echo "$response" | SLUG="$slug" ruby -rjson -e '
+    data = JSON.parse(STDIN.read)
+    slugs = data["accounts"].map { |a| a["slug"] }
+    puts slugs.include?(ENV["SLUG"]) ? "yes" : "no:#{slugs.join(",")}"
+  ')
+
+  if [[ "$valid" != "yes" ]]; then
+    local available="${valid#no:}"
+    die "Account '$slug' is not one of your accounts. Available: $available"
+  fi
+
+  echo "account=$slug" > "$target"
+  echo "Wrote $target (account=$slug)"
+}
+
+cmd_accounts_current() {
+  load_token
+  resolve_account
+  if [[ -n "$ACCOUNT_SLUG" ]]; then
+    echo "$ACCOUNT_SLUG (from $ACCOUNT_SOURCE)"
+  else
+    echo "(none — server will use default if you have exactly one account)"
+  fi
+}
+
 cmd_errors_list() {
   load_token
+  resolve_account
 
   local status="unresolved"
   local severity=""
@@ -256,6 +445,7 @@ cmd_errors_list() {
 
 cmd_errors_show() {
   load_token
+  resolve_account
 
   local error_id="${1:-}"
   [[ -n "$error_id" ]] || die "Usage: squirrelstack errors show <ID>"
@@ -360,6 +550,7 @@ cmd_errors_show() {
 
 cmd_errors_update() {
   load_token
+  resolve_account
 
   local error_id="${1:-}"
   [[ -n "$error_id" ]] || die "Usage: squirrelstack errors update <ID> [--status ...] [--priority ...] [--assign ...]"
@@ -409,6 +600,7 @@ cmd_errors_update() {
 
 cmd_errors_comment() {
   load_token
+  resolve_account
 
   local error_id="${1:-}"
   [[ -n "$error_id" ]] || die "Usage: squirrelstack errors comment <ID> <message>"
@@ -433,6 +625,7 @@ cmd_errors_comment() {
 
 cmd_errors_members() {
   load_token
+  resolve_account
 
   local response
   response=$(api_get "/members")
@@ -452,13 +645,24 @@ cmd_help() {
 squirrelstack — CLI for SquirrelStack
 
 Usage:
-  squirrelstack login                         Authenticate via browser (OAuth)
-  squirrelstack logout                        Remove token from Keychain
-  squirrelstack errors [options]              List open errors
-  squirrelstack errors show <ID>              Show error details with notes
-  squirrelstack errors update <ID> [options]  Update error status/priority/assignee
-  squirrelstack errors comment <ID> <message> Add a note to an error
-  squirrelstack errors members                List team members (for --assign)
+  squirrelstack login                             Authenticate via browser (OAuth)
+  squirrelstack logout                            Remove token from Keychain
+  squirrelstack accounts                          List accounts you can access
+  squirrelstack accounts use <slug> [-g]          Pin account for cwd (or globally with -g)
+  squirrelstack accounts use --clear [-g]         Remove the pinned account
+  squirrelstack accounts current                  Show resolved account + source
+  squirrelstack errors [options]                  List open errors
+  squirrelstack errors show <ID>                  Show error details with notes
+  squirrelstack errors update <ID> [options]      Update error status/priority/assignee
+  squirrelstack errors comment <ID> <message>     Add a note to an error
+  squirrelstack errors members                    List team members (for --assign)
+
+Account selection (in order):
+  --account <slug>         Flag (highest priority)
+  SQUIRRELSTACK_ACCOUNT    Env var
+  ./.squirrelstack         Walked up from cwd (account=<slug>)
+  ~/.squirrelstack         Global default
+  (server default)         Used when your user has exactly one account
 
 Options for 'errors':
   --status <status>     Filter: unresolved (default), resolved, ignored, all
@@ -475,8 +679,9 @@ Options for 'errors show':
   --json                Output raw JSON
 
 Environment variables:
-  SQUIRRELSTACK_TOKEN   PAT token (overrides Keychain)
-  SQUIRRELSTACK_URL     API base URL (default: https://squirrelstack.app)
+  SQUIRRELSTACK_TOKEN     PAT token (overrides Keychain)
+  SQUIRRELSTACK_ACCOUNT   Account slug to send as X-Account-Slug
+  SQUIRRELSTACK_URL       API base URL (default: https://squirrelstack.app)
 
 Token is stored securely in macOS Keychain. On first use, you'll be
 prompted to log in or paste a PAT.
@@ -485,12 +690,32 @@ HELP
 
 # --- Main ---
 
+# Pre-scan for --account flag so it can appear anywhere in the args.
+args=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --account)    ACCOUNT_FLAG="${2:-}"; shift 2 ;;
+    --account=*)  ACCOUNT_FLAG="${1#--account=}"; shift ;;
+    *)            args+=("$1"); shift ;;
+  esac
+done
+set -- ${args[@]+"${args[@]}"}
+
 command="${1:-help}"
 shift || true
 
 case "$command" in
   login)         cmd_login ;;
   logout)        cmd_logout ;;
+  accounts)
+    subcommand="${1:-list}"
+    case "$subcommand" in
+      use)     shift; cmd_accounts_use "$@" ;;
+      current) cmd_accounts_current ;;
+      list|"") cmd_accounts_list ;;
+      *)       die "Unknown accounts subcommand: $subcommand. Try: list, use, current" ;;
+    esac
+    ;;
   errors)
     subcommand="${1:-list}"
     case "$subcommand" in

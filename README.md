@@ -31,6 +31,39 @@ squirrelstack login     # Authenticate via browser (OAuth)
 squirrelstack logout    # Remove token from Keychain
 ```
 
+## Accounts
+
+Your PAT identifies you as a user — you can belong to multiple SquirrelStack accounts.
+The CLI picks one per request from the following sources, in order:
+
+1. `--account <slug>` flag
+2. `SQUIRRELSTACK_ACCOUNT` env var
+3. Nearest `.squirrelstack` file, walked up from the current directory
+4. `~/.squirrelstack` global default
+5. Server default (only works when your user has exactly one account)
+
+```bash
+# See what accounts you can access (and which one is currently selected)
+squirrelstack accounts
+
+# Pin the current directory tree to an account
+squirrelstack accounts use acme
+
+# Set a global default
+squirrelstack accounts use acme -g
+
+# Remove a pinned account
+squirrelstack accounts use --clear           # remove ./.squirrelstack
+squirrelstack accounts use --clear -g        # remove ~/.squirrelstack
+
+# Show what's currently resolved and from where
+squirrelstack accounts current
+```
+
+The `.squirrelstack` file is plain text and contains a single line: `account=<slug>`.
+Commit it if your team should share the same default for a project, or gitignore it
+if it's personal.
+
 ## Usage
 
 ```bash
@@ -62,6 +95,7 @@ squirrelstack errors members
 | Variable | Description |
 |---|---|
 | `SQUIRRELSTACK_TOKEN` | PAT token (overrides Keychain) |
+| `SQUIRRELSTACK_ACCOUNT` | Account slug to send as `X-Account-Slug` |
 | `SQUIRRELSTACK_URL` | API base URL (default: `https://squirrelstack.app`) |
 
 ## Releasing
