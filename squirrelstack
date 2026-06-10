@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="0.2.0"
+VERSION="0.3.0"
 KEYCHAIN_SERVICE="squirrelstack-cli"
 KEYCHAIN_ACCOUNT="pat"
 BASE_URL="${SQUIRRELSTACK_URL:-https://squirrelstack.app}"
@@ -640,6 +640,132 @@ cmd_errors_members() {
   '
 }
 
+cmd_tickets_list() {
+  load_token
+  resolve_account
+
+  local state="open"
+  local priority=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --state)    state="$2"; shift 2 ;;
+      --priority) priority="$2"; shift 2 ;;
+      --json)     JSON_OUTPUT=1; shift ;;
+      *)          die "Unknown option: $1" ;;
+    esac
+  done
+
+  local query="state=${state}"
+  [[ -n "$priority" ]] && query="${query}&priority=${priority}"
+
+  local response
+  response=$(api_get "/tickets?${query}")
+
+  if [[ "${JSON_OUTPUT:-}" == "1" ]]; then
+    echo "$response" | ruby -rjson -e 'puts JSON.pretty_generate(JSON.parse(STDIN.read))'
+    return
+  fi
+
+  local count
+  count=$(echo "$response" | ruby -rjson -e 'puts JSON.parse(STDIN.read)["tickets"].length')
+
+  if [[ "$count" == "0" ]]; then
+    echo "No ${state} tickets found."
+    return
+  fi
+
+  echo "$response" | ruby -rjson -rtime -e '
+    tickets = JSON.parse(STDIN.read)["tickets"]
+
+    printf "%-8s  %-8s  %-7s  %4s  %-22s  %-15s  %-40s  %s\n", "ID", "STATE", "PRI", "MSGS", "CONTACT", "ASSIGNEE", "SUBJECT", "UPDATED"
+    printf "%s\n", "-" * 130
+
+    tickets.each do |t|
+      id = t["id"].to_s
+      state = t["state"].to_s[0..7]
+      pri = t["priority"].to_s[0..6]
+      msgs = t["messages_count"].to_s
+      contact = (t.dig("contact", "name") || t.dig("contact", "email")).to_s[0..20]
+      assignee = t.dig("assignee", "name").to_s[0..13]
+      subject = t["subject"].to_s[0..38]
+      updated = t["updated_at"] ? Time.parse(t["updated_at"]).strftime("%Y-%m-%d %H:%M") : ""
+
+      printf "%-8s  %-8s  %-7s  %4s  %-22s  %-15s  %-40s  %s\n", id, state, pri, msgs, contact, assignee, subject, updated
+    end
+
+    puts
+    puts "#{tickets.length} ticket(s). Use: squirrelstack tickets show <ID> for the full thread."
+  '
+}
+
+cmd_tickets_show() {
+  load_token
+  resolve_account
+
+  local ticket_id="${1:-}"
+  [[ -n "$ticket_id" ]] || die "Usage: squirrelstack tickets show <ID>"
+
+  local json_output="${2:-}"
+
+  local response
+  response=$(api_get "/tickets/${ticket_id}")
+
+  if [[ "$json_output" == "--json" ]]; then
+    echo "$response" | ruby -rjson -e 'puts JSON.pretty_generate(JSON.parse(STDIN.read))'
+    return
+  fi
+
+  echo "$response" | ruby -rjson -rtime -e '
+    t = JSON.parse(STDIN.read)["ticket"]
+
+    puts "=" * 80
+    puts t["subject"]
+    puts "=" * 80
+    puts
+    puts "ID:        #{t["id"]}"
+    puts "State:     #{t["state"]}"
+    puts "Priority:  #{t["priority"] || "(not set)"}"
+    puts "Source:    #{t["source"]}"
+    puts "Contact:   #{t.dig("contact", "name") || "(no name)"} <#{t.dig("contact", "email")}>"
+    puts "Assignee:  #{t.dig("assignee", "name") || "(unassigned)"}"
+    puts "Created:   #{t["created_at"]}"
+    puts "Updated:   #{t["updated_at"]}"
+    puts
+
+    if t["summary"] && !t["summary"].empty?
+      puts "SUMMARY"
+      puts "-" * 80
+      puts t["summary"]
+      puts
+    end
+
+    messages = t["messages"] || []
+    puts "MESSAGES (#{messages.length})"
+    puts "-" * 80
+
+    messages.each do |m|
+      time = m["received_at"] || m["created_at"]
+      time = Time.parse(time).strftime("%Y-%m-%d %H:%M") if time
+      author = m["author"] || "(unknown)"
+
+      label = m["type"]
+      label = "email #{m["direction"]}" if m["type"] == "email" && m["direction"]
+
+      puts
+      puts "[#{time}] #{author} (#{label})"
+      (m["body"] || "").split("\n").each { |line| puts "  #{line}" }
+
+      if m["files"].is_a?(Array) && !m["files"].empty?
+        m["files"].each do |f|
+          kb = (f["byte_size"].to_f / 1024).round(1)
+          puts "  📎 #{f["filename"]} (#{f["content_type"]}, #{kb} KB)"
+        end
+      end
+    end
+  '
+}
+
 cmd_help() {
   cat <<'HELP'
 squirrelstack — CLI for SquirrelStack
@@ -656,6 +782,8 @@ Usage:
   squirrelstack errors update <ID> [options]      Update error status/priority/assignee
   squirrelstack errors comment <ID> <message>     Add a note to an error
   squirrelstack errors members                    List team members (for --assign)
+  squirrelstack tickets [options]                 List open helpdesk tickets
+  squirrelstack tickets show <ID>                 Show ticket details with messages
 
 Account selection (in order):
   --account <slug>         Flag (highest priority)
@@ -676,6 +804,14 @@ Options for 'errors update':
   --assign <user_id>    Assign to user (use 'none' to unassign)
 
 Options for 'errors show':
+  --json                Output raw JSON
+
+Options for 'tickets':
+  --state <state>       Filter: open (default), new, assigned, closed, all
+  --priority <level>    Filter: urgent, high, normal, low
+  --json                Output raw JSON
+
+Options for 'tickets show':
   --json                Output raw JSON
 
 Environment variables:
@@ -724,6 +860,13 @@ case "$command" in
       comment) shift; cmd_errors_comment "$@" ;;
       members) cmd_errors_members ;;
       *)       cmd_errors_list "$@" ;;
+    esac
+    ;;
+  tickets)
+    subcommand="${1:-list}"
+    case "$subcommand" in
+      show) shift; cmd_tickets_show "$@" ;;
+      *)    cmd_tickets_list "$@" ;;
     esac
     ;;
   version|--version|-v) echo "squirrelstack $VERSION" ;;

@@ -90,6 +90,20 @@ squirrelstack errors comment <ID> "Root cause identified"
 squirrelstack errors members
 ```
 
+## Helpdesk tickets
+
+```bash
+# List open tickets (state: new or assigned)
+squirrelstack tickets
+squirrelstack tickets --state closed
+squirrelstack tickets --state all --priority urgent
+squirrelstack tickets --json
+
+# View a ticket with its full message thread
+squirrelstack tickets show <ID>
+squirrelstack tickets show <ID> --json
+```
+
 ## Environment Variables
 
 | Variable | Description |
