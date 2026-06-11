@@ -1,16 +1,28 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="0.3.0"
+VERSION="0.4.0"
 KEYCHAIN_SERVICE="squirrelstack-cli"
-KEYCHAIN_ACCOUNT="pat"
+LEGACY_KEYCHAIN_ACCOUNT="pat"   # pre-0.4 single-token storage; migrated on first use
 BASE_URL="${SQUIRRELSTACK_URL:-https://squirrelstack.app}"
 CLIENT_NAME="SquirrelStack CLI"
+
+# Index of logged-in users (one email per line). Not secret — tokens live in Keychain.
+USERS_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/squirrelstack"
+USERS_INDEX="$USERS_DIR/users"
 
 # Account resolution. Populated by resolve_account(); used by api_request.
 ACCOUNT_SLUG=""
 ACCOUNT_SOURCE=""
 ACCOUNT_FLAG=""
+
+# User resolution. Populated by resolve_user(); selects which Keychain token to use.
+USER_EMAIL=""
+USER_SOURCE=""
+USER_FLAG=""
+
+# Set by register_token() to the email it stored a token for.
+REGISTERED_USER=""
 
 urlencode() { ruby -ruri -e 'print URI.encode_www_form_component(ARGV[0])' -- "$1"; }
 
@@ -18,18 +30,113 @@ urlencode() { ruby -ruri -e 'print URI.encode_www_form_component(ARGV[0])' -- "$
 
 die() { echo "Error: $1" >&2; exit 1; }
 
-keychain_get() {
-  security find-generic-password -s "$KEYCHAIN_SERVICE" -a "$KEYCHAIN_ACCOUNT" -w 2>/dev/null || echo ""
+# Keychain entries are keyed by the user's email (account = email). The pre-0.4
+# single-token entry used the constant LEGACY_KEYCHAIN_ACCOUNT; it's migrated away.
+keychain_get_for() {
+  security find-generic-password -s "$KEYCHAIN_SERVICE" -a "$1" -w 2>/dev/null || echo ""
 }
 
-keychain_set() {
-  local token="$1"
-  security delete-generic-password -s "$KEYCHAIN_SERVICE" -a "$KEYCHAIN_ACCOUNT" 2>/dev/null || true
-  security add-generic-password -s "$KEYCHAIN_SERVICE" -a "$KEYCHAIN_ACCOUNT" -w "$token"
+keychain_set_for() {
+  local account="$1" token="$2"
+  security delete-generic-password -s "$KEYCHAIN_SERVICE" -a "$account" 2>/dev/null || true
+  security add-generic-password -s "$KEYCHAIN_SERVICE" -a "$account" -w "$token"
 }
 
-keychain_delete() {
-  security delete-generic-password -s "$KEYCHAIN_SERVICE" -a "$KEYCHAIN_ACCOUNT" 2>/dev/null || true
+keychain_delete_for() {
+  security delete-generic-password -s "$KEYCHAIN_SERVICE" -a "$1" 2>/dev/null || true
+}
+
+# --- User index (logged-in emails; not secret — tokens live in Keychain) ---
+
+users_index_list() {
+  [[ -f "$USERS_INDEX" ]] && grep -v '^[[:space:]]*$' "$USERS_INDEX" || true
+}
+
+users_index_add() {
+  mkdir -p "$USERS_DIR"
+  touch "$USERS_INDEX"
+  grep -qxF "$1" "$USERS_INDEX" || echo "$1" >> "$USERS_INDEX"
+}
+
+users_index_remove() {
+  [[ -f "$USERS_INDEX" ]] || return 0
+  grep -vxF "$1" "$USERS_INDEX" > "$USERS_INDEX.tmp" 2>/dev/null || true
+  mv "$USERS_INDEX.tmp" "$USERS_INDEX"
+  [[ -s "$USERS_INDEX" ]] || rm -f "$USERS_INDEX"
+}
+
+users_index_count() {
+  local n
+  n=$(users_index_list | grep -c . || true)
+  echo "${n:-0}"
+}
+
+multi_user_error() {
+  {
+    echo "Error: multiple users are logged in — pick one."
+    echo "  squirrelstack --user <email> ..."
+    echo "  squirrelstack users use <email>"
+    echo "  export SQUIRRELSTACK_USER=<email>"
+    echo "Logged in: $(users_index_list | paste -sd ', ' -)"
+  } >&2
+  exit 1
+}
+
+# Verifies a token against /api/v1/me, then stores it keyed by the user's email
+# and adds the email to the index. Sets REGISTERED_USER. Dies on a bad token.
+register_token() {
+  local token="$1" me email
+  me=$(curl -sS -H "Authorization: Bearer $token" "${BASE_URL}/api/v1/me") \
+    || die "Could not verify token (request to /api/v1/me failed)."
+  email=$(printf '%s' "$me" | ruby -rjson -e '
+    data = JSON.parse(STDIN.read) rescue {}
+    email = data["email"] || (data["user"] && data["user"]["email"]) || data["user_email"]
+    if email.nil? || email.to_s.strip.empty?
+      $stderr.puts "Could not determine your email from /api/v1/me (token may be invalid)."
+      exit 1
+    end
+    puts email
+  ') || die "Token verification failed."
+  keychain_set_for "$email" "$token"
+  users_index_add "$email"
+  REGISTERED_USER="$email"
+}
+
+# Pre-0.4 stored a single token under LEGACY_KEYCHAIN_ACCOUNT. If the index is
+# empty but that token exists, adopt it into email-keyed storage. Best-effort:
+# if /me is unreachable (offline) the legacy entry is left in place for fallback.
+migrate_legacy_token() {
+  [[ "$(users_index_count)" == "0" ]] || return 0
+  local legacy
+  legacy=$(keychain_get_for "$LEGACY_KEYCHAIN_ACCOUNT")
+  [[ -n "$legacy" ]] || return 0
+  echo "Migrating your saved login to multi-user storage..." >&2
+  if register_token "$legacy" 2>/dev/null; then
+    keychain_delete_for "$LEGACY_KEYCHAIN_ACCOUNT"
+    echo "Migrated as $REGISTERED_USER." >&2
+  fi
+}
+
+first_run_setup() {
+  echo "No token found. Let's set one up."
+  echo ""
+  echo "You can either:"
+  echo "  1. Log in via your browser (recommended)"
+  echo "  2. Paste an existing PAT"
+  echo ""
+  read -rp "Choose [1/2]: " choice
+
+  case "$choice" in
+    1) cmd_login ;;
+    2)
+      read -rsp "Paste your PAT (pat_...): " token
+      echo ""
+      [[ "$token" == pat_* ]] || die "Token must start with pat_"
+      register_token "$token"
+      echo "Token saved for $REGISTERED_USER."
+      ;;
+    *) die "Invalid choice." ;;
+  esac
 }
 
 load_token() {
@@ -38,41 +145,125 @@ load_token() {
     return
   fi
 
-  TOKEN=$(keychain_get)
-  if [[ -z "$TOKEN" ]]; then
-    echo "No token found. Let's set one up."
-    echo ""
-    echo "You can either:"
-    echo "  1. Log in via your browser (recommended)"
-    echo "  2. Paste an existing PAT"
-    echo ""
-    read -rp "Choose [1/2]: " choice
+  migrate_legacy_token
+  resolve_user
 
-    case "$choice" in
-      1) cmd_login ;;
-      2)
-        read -rsp "Paste your PAT (pat_...): " token
-        echo ""
-        [[ "$token" == pat_* ]] || die "Token must start with pat_"
-        keychain_set "$token"
-        echo "Token saved to Keychain."
-        ;;
-      *) die "Invalid choice." ;;
-    esac
-
-    TOKEN=$(keychain_get)
-    [[ -n "$TOKEN" ]] || die "Token setup failed."
+  # A user resolved (via flag/env/config/single default) — use their token.
+  if [[ -n "$USER_EMAIL" ]]; then
+    TOKEN=$(keychain_get_for "$USER_EMAIL")
+    [[ -n "$TOKEN" ]] || die "No saved token for '$USER_EMAIL' (selected via $USER_SOURCE). Run: squirrelstack login"
+    return
   fi
+
+  # No user resolved but several are logged in — make them choose.
+  [[ "$(users_index_count)" -le 1 ]] || multi_user_error
+
+  # Offline-migration fallback: legacy token still present, index empty.
+  local legacy
+  legacy=$(keychain_get_for "$LEGACY_KEYCHAIN_ACCOUNT")
+  if [[ -n "$legacy" ]]; then
+    TOKEN="$legacy"
+    return
+  fi
+
+  # Nothing stored at all — first-run interactive setup.
+  first_run_setup
+  resolve_user
+  TOKEN=$(keychain_get_for "$USER_EMAIL")
+  [[ -n "$TOKEN" ]] || die "Token setup failed."
 }
 
 # Reads the `account=` line from a `.squirrelstack` file. Returns empty on miss.
 read_account_from_file() {
-  local file="$1"
+  read_config_key "$1" account
+}
+
+# Reads the `user=` line from a `.squirrelstack` file. Returns empty on miss.
+read_user_from_file() {
+  read_config_key "$1" user
+}
+
+# Reads a `key=value` line from a config file. Returns empty on miss.
+# The trailing `|| true` matters: under `set -o pipefail`, a non-matching grep
+# fails the whole pipeline, which would trip `set -e` at the calling assignment.
+read_config_key() {
+  local file="$1" key="$2"
   [[ -f "$file" ]] || { echo ""; return; }
-  grep -E "^account[[:space:]]*=" "$file" 2>/dev/null \
+  grep -E "^${key}[[:space:]]*=" "$file" 2>/dev/null \
     | head -1 \
-    | sed -E 's/^account[[:space:]]*=[[:space:]]*//' \
-    | tr -d '[:space:]'
+    | sed -E "s/^${key}[[:space:]]*=[[:space:]]*//" \
+    | tr -d '[:space:]' || true
+}
+
+# Upserts `key=value` in a config file, preserving other lines. Creates the file
+# if needed. account= and user= share the same .squirrelstack file, so writes
+# must not clobber the other key.
+set_config_key() {
+  local file="$1" key="$2" value="$3"
+  if [[ -f "$file" ]]; then
+    grep -vE "^${key}[[:space:]]*=" "$file" > "$file.tmp" 2>/dev/null || true
+    mv "$file.tmp" "$file"
+  fi
+  echo "${key}=${value}" >> "$file"
+}
+
+# Removes a `key=` line from a config file, deleting the file if it ends up empty.
+clear_config_key() {
+  local file="$1" key="$2"
+  [[ -f "$file" ]] || return 0
+  grep -vE "^${key}[[:space:]]*=" "$file" > "$file.tmp" 2>/dev/null || true
+  mv "$file.tmp" "$file"
+  [[ -s "$file" ]] || rm -f "$file"
+}
+
+# Resolution order (mirrors resolve_account, one level up — a user owns accounts):
+#   1. --user flag
+#   2. SQUIRRELSTACK_USER env
+#   3. .squirrelstack walked up from cwd (stops at $HOME or /)
+#   4. ~/.squirrelstack
+#   5. The only logged-in user, if there's exactly one
+resolve_user() {
+  if [[ -n "$USER_FLAG" ]]; then
+    USER_EMAIL="$USER_FLAG"
+    USER_SOURCE="--user flag"
+    return
+  fi
+
+  if [[ -n "${SQUIRRELSTACK_USER:-}" ]]; then
+    USER_EMAIL="$SQUIRRELSTACK_USER"
+    USER_SOURCE="SQUIRRELSTACK_USER env var"
+    return
+  fi
+
+  local dir="$PWD"
+  while [[ "$dir" != "/" ]]; do
+    local found
+    found=$(read_user_from_file "$dir/.squirrelstack")
+    if [[ -n "$found" ]]; then
+      USER_EMAIL="$found"
+      USER_SOURCE="$dir/.squirrelstack"
+      return
+    fi
+    [[ "$dir" == "$HOME" ]] && break
+    dir=$(dirname "$dir")
+  done
+
+  local home_value
+  home_value=$(read_user_from_file "$HOME/.squirrelstack")
+  if [[ -n "$home_value" ]]; then
+    USER_EMAIL="$home_value"
+    USER_SOURCE="$HOME/.squirrelstack"
+    return
+  fi
+
+  if [[ "$(users_index_count)" == "1" ]]; then
+    USER_EMAIL="$(users_index_list)"
+    USER_SOURCE="only logged-in user"
+    return
+  fi
+
+  USER_EMAIL=""
+  USER_SOURCE=""
 }
 
 # Resolution order:
@@ -139,9 +330,18 @@ api_request() {
   body=$(echo "$response" | sed '$d')
 
   if [[ "$http_code" == "401" ]]; then
-    echo "Token is invalid or expired. Removing from Keychain." >&2
-    keychain_delete
-    die "Please run the command again to re-authenticate."
+    if [[ -z "${SQUIRRELSTACK_TOKEN:-}" ]]; then
+      echo "Token is invalid or expired. Removing from Keychain." >&2
+      if [[ -n "$USER_EMAIL" ]]; then
+        keychain_delete_for "$USER_EMAIL"
+        users_index_remove "$USER_EMAIL"
+      else
+        keychain_delete_for "$LEGACY_KEYCHAIN_ACCOUNT"
+      fi
+    else
+      echo "Token (SQUIRRELSTACK_TOKEN) is invalid or expired." >&2
+    fi
+    die "Please run 'squirrelstack login' to re-authenticate."
   fi
 
   if [[ "$http_code" == "400" ]] && echo "$body" | grep -q "Account required"; then
@@ -269,15 +469,117 @@ cmd_login() {
 
   [[ -n "$access_token" ]] || die "No access token received."
 
-  keychain_set "$access_token"
-  echo "Authenticated! Token saved to Keychain."
+  register_token "$access_token"
+  echo "Authenticated as $REGISTERED_USER! Token saved to Keychain."
 }
 
 # --- Commands ---
 
+# Logs out a user. Defaults to the active/resolved user (or the only one).
 cmd_logout() {
-  keychain_delete
-  echo "Token removed from Keychain."
+  local email="${1:-}"
+
+  if [[ -z "$email" ]]; then
+    resolve_user
+    email="$USER_EMAIL"
+  fi
+
+  # No users tracked — fall back to clearing any legacy single-token entry.
+  if [[ -z "$email" ]]; then
+    if [[ "$(users_index_count)" -gt 1 ]]; then
+      die "Multiple users are logged in. Specify which: squirrelstack logout <email>"
+    fi
+    keychain_delete_for "$LEGACY_KEYCHAIN_ACCOUNT"
+    echo "Token removed from Keychain."
+    return
+  fi
+
+  keychain_delete_for "$email"
+  users_index_remove "$email"
+  # Drop a global pin that points at this user so it doesn't dangle.
+  [[ "$(read_user_from_file "$HOME/.squirrelstack")" == "$email" ]] && clear_config_key "$HOME/.squirrelstack" user
+  echo "Logged out $email."
+}
+
+cmd_whoami() {
+  load_token
+  resolve_account
+
+  if [[ -n "${SQUIRRELSTACK_TOKEN:-}" ]]; then
+    echo "User:    (from SQUIRRELSTACK_TOKEN env)"
+  elif [[ -n "$USER_EMAIL" ]]; then
+    echo "User:    $USER_EMAIL (from $USER_SOURCE)"
+  else
+    echo "User:    (unknown)"
+  fi
+
+  if [[ -n "$ACCOUNT_SLUG" ]]; then
+    echo "Account: $ACCOUNT_SLUG (from $ACCOUNT_SOURCE)"
+  else
+    echo "Account: (server default)"
+  fi
+}
+
+# Lists logged-in users, marking the active one.
+cmd_users_list() {
+  resolve_user
+
+  local users
+  users=$(users_index_list)
+  if [[ -z "$users" ]]; then
+    echo "No users logged in. Run: squirrelstack login"
+    return
+  fi
+
+  printf "%-3s  %s\n" "" "EMAIL"
+  while IFS= read -r u; do
+    [[ -z "$u" ]] && continue
+    local marker=" "
+    [[ "$u" == "$USER_EMAIL" ]] && marker="*"
+    printf "%-3s  %s\n" "$marker" "$u"
+  done <<< "$users"
+
+  echo
+  if [[ -n "$USER_EMAIL" ]]; then
+    echo "Active: $USER_EMAIL ($USER_SOURCE)"
+  else
+    echo "Active: (none — multiple users; pick with 'squirrelstack users use <email>')"
+  fi
+}
+
+cmd_users_use() {
+  local email="${1:-}"
+  [[ -n "$email" ]] || die "Usage: squirrelstack users use <email> [-g|--global]  or  squirrelstack users use --clear [-g|--global]"
+
+  local global=0
+  local clear=0
+  [[ "$email" == "--clear" ]] && clear=1
+
+  case "${2:-}" in
+    -g|--global) global=1 ;;
+    "") ;;
+    *) die "Unknown option: ${2}" ;;
+  esac
+
+  local target
+  if [[ "$global" == "1" ]]; then
+    target="$HOME/.squirrelstack"
+  else
+    target="$PWD/.squirrelstack"
+  fi
+
+  if [[ "$clear" == "1" ]]; then
+    clear_config_key "$target" user
+    echo "Cleared user from $target"
+    return
+  fi
+
+  if ! users_index_list | grep -qxF "$email"; then
+    die "Not logged in as '$email'. Logged in: $(users_index_list | paste -sd ', ' -). Run: squirrelstack login"
+  fi
+
+  set_config_key "$target" user "$email"
+  echo "Wrote $target (user=$email)"
 }
 
 # Fetches /api/v1/me and prints accounts, marking the currently resolved one.
@@ -339,11 +641,11 @@ cmd_accounts_use() {
   fi
 
   if [[ "$clear" == "1" ]]; then
-    if [[ -f "$target" ]]; then
-      rm "$target"
-      echo "Removed $target"
+    if [[ -f "$target" ]] && [[ -n "$(read_account_from_file "$target")" ]]; then
+      clear_config_key "$target" account
+      echo "Cleared account from $target"
     else
-      echo "No config at $target"
+      echo "No pinned account at $target"
     fi
     return
   fi
@@ -364,7 +666,7 @@ cmd_accounts_use() {
     die "Account '$slug' is not one of your accounts. Available: $available"
   fi
 
-  echo "account=$slug" > "$target"
+  set_config_key "$target" account "$slug"
   echo "Wrote $target (account=$slug)"
 }
 
@@ -771,8 +1073,12 @@ cmd_help() {
 squirrelstack — CLI for SquirrelStack
 
 Usage:
-  squirrelstack login                             Authenticate via browser (OAuth)
-  squirrelstack logout                            Remove token from Keychain
+  squirrelstack login                             Authenticate a user via browser (OAuth)
+  squirrelstack logout [email]                    Log out a user (default: active user)
+  squirrelstack whoami                            Show the active user + account
+  squirrelstack users                             List logged-in users
+  squirrelstack users use <email> [-g]            Pin user for cwd (or globally with -g)
+  squirrelstack users use --clear [-g]            Remove the pinned user
   squirrelstack accounts                          List accounts you can access
   squirrelstack accounts use <slug> [-g]          Pin account for cwd (or globally with -g)
   squirrelstack accounts use --clear [-g]         Remove the pinned account
@@ -784,6 +1090,13 @@ Usage:
   squirrelstack errors members                    List team members (for --assign)
   squirrelstack tickets [options]                 List open helpdesk tickets
   squirrelstack tickets show <ID>                 Show ticket details with messages
+
+User selection (in order):
+  --user <email>           Flag (highest priority)
+  SQUIRRELSTACK_USER       Env var
+  ./.squirrelstack         Walked up from cwd (user=<email>)
+  ~/.squirrelstack         Global default
+  (single user)            Used when exactly one user is logged in
 
 Account selection (in order):
   --account <slug>         Flag (highest priority)
@@ -815,23 +1128,27 @@ Options for 'tickets show':
   --json                Output raw JSON
 
 Environment variables:
-  SQUIRRELSTACK_TOKEN     PAT token (overrides Keychain)
+  SQUIRRELSTACK_TOKEN     PAT token (overrides Keychain and user selection)
+  SQUIRRELSTACK_USER      Email of the logged-in user to use
   SQUIRRELSTACK_ACCOUNT   Account slug to send as X-Account-Slug
   SQUIRRELSTACK_URL       API base URL (default: https://squirrelstack.app)
 
-Token is stored securely in macOS Keychain. On first use, you'll be
-prompted to log in or paste a PAT.
+Tokens are stored securely in macOS Keychain, one per user. You can log in
+as multiple users and switch between them per directory or globally. On first
+use, you'll be prompted to log in or paste a PAT.
 HELP
 }
 
 # --- Main ---
 
-# Pre-scan for --account flag so it can appear anywhere in the args.
+# Pre-scan for --account and --user flags so they can appear anywhere in the args.
 args=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --account)    ACCOUNT_FLAG="${2:-}"; shift 2 ;;
     --account=*)  ACCOUNT_FLAG="${1#--account=}"; shift ;;
+    --user)       USER_FLAG="${2:-}"; shift 2 ;;
+    --user=*)     USER_FLAG="${1#--user=}"; shift ;;
     *)            args+=("$1"); shift ;;
   esac
 done
@@ -842,7 +1159,16 @@ shift || true
 
 case "$command" in
   login)         cmd_login ;;
-  logout)        cmd_logout ;;
+  logout)        cmd_logout "$@" ;;
+  whoami)        cmd_whoami ;;
+  users)
+    subcommand="${1:-list}"
+    case "$subcommand" in
+      use)     shift; cmd_users_use "$@" ;;
+      list|"") cmd_users_list ;;
+      *)       die "Unknown users subcommand: $subcommand. Try: list, use" ;;
+    esac
+    ;;
   accounts)
     subcommand="${1:-list}"
     case "$subcommand" in

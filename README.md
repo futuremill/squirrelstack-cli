@@ -28,8 +28,49 @@ On first use, you'll be prompted to log in via your browser or paste a PAT. Toke
 
 ```bash
 squirrelstack login     # Authenticate via browser (OAuth)
-squirrelstack logout    # Remove token from Keychain
+squirrelstack logout    # Log out the active user
+squirrelstack whoami    # Show the active user and account
 ```
+
+## Users
+
+You can be logged in as **multiple users** at once — each `login` stores a
+separate token in the Keychain, keyed by the email reported by the server. The
+CLI picks which user to act as from the following sources, in order:
+
+1. `--user <email>` flag
+2. `SQUIRRELSTACK_USER` env var
+3. Nearest `.squirrelstack` file, walked up from the current directory (`user=<email>`)
+4. `~/.squirrelstack` global default (`user=<email>`)
+5. The only logged-in user, if there's exactly one
+
+When more than one user is logged in and none is selected, commands stop and ask
+you to pick one.
+
+```bash
+# Log in as additional users (repeat for each)
+squirrelstack login
+
+# See who's logged in (the active one is marked *)
+squirrelstack users
+
+# Pin the current directory tree to a user
+squirrelstack users use bob@example.com
+
+# Set a global default user
+squirrelstack users use bob@example.com -g
+
+# Remove a pinned user
+squirrelstack users use --clear        # remove user= from ./.squirrelstack
+squirrelstack users use --clear -g     # remove user= from ~/.squirrelstack
+
+# Log out a specific user (default: the active one)
+squirrelstack logout bob@example.com
+```
+
+A single `.squirrelstack` file can pin both a user and an account
+(`user=<email>` and `account=<slug>` on separate lines). If you upgraded from an
+earlier version, your existing login is migrated automatically on first use.
 
 ## Accounts
 
@@ -60,9 +101,9 @@ squirrelstack accounts use --clear -g        # remove ~/.squirrelstack
 squirrelstack accounts current
 ```
 
-The `.squirrelstack` file is plain text and contains a single line: `account=<slug>`.
-Commit it if your team should share the same default for a project, or gitignore it
-if it's personal.
+The `.squirrelstack` file is plain text with one `key=value` per line
+(`account=<slug>` and optionally `user=<email>`). Commit it if your team should
+share the same default for a project, or gitignore it if it's personal.
 
 ## Usage
 
