@@ -1,6 +1,6 @@
 # SquirrelStack CLI
 
-Command-line tool for [SquirrelStack](https://squirrelstack.app) error management.
+Command-line tool for [SquirrelStack](https://squirrelstack.app): errors, helpdesk tickets, and project epics and stories.
 
 ## Install
 
@@ -143,6 +143,39 @@ squirrelstack tickets --json
 # View a ticket with its full message thread
 squirrelstack tickets show <ID>
 squirrelstack tickets show <ID> --json
+```
+
+## Projects
+
+Epics and stories on the account's board. Creating and updating needs the
+Projects edit permission on your membership.
+
+```bash
+# List epics (optionally by bucket or owner)
+squirrelstack epics
+squirrelstack epics --bucket next
+squirrelstack epics --json
+
+# Show an epic with its stories and notes
+squirrelstack epics show <ID>
+
+# Create and update epics (new epics default to the future bucket)
+squirrelstack epics create "Billing" --bucket next --theme Feature --owner <user_id>
+squirrelstack epics update <ID> --bucket now
+squirrelstack epics update <ID> --title "Billing v2" --start 2026-10-01 --end 2026-12-01
+
+# List stories (optionally by status, epic or owner)
+squirrelstack stories
+squirrelstack stories --status doing
+squirrelstack stories --epic <epic_id>
+
+# Show a story with its tasks and notes
+squirrelstack stories show <ID>
+
+# Create a story in an epic, then move it across the board
+squirrelstack stories create "Wire up search" --epic <epic_id> --points 2
+squirrelstack stories update <ID> --status doing --owner <user_id>
+squirrelstack stories update <ID> --status done
 ```
 
 ## Environment Variables

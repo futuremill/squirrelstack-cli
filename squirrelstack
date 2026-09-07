@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="0.4.0"
+VERSION="0.5.0"
 KEYCHAIN_SERVICE="squirrelstack-cli"
 LEGACY_KEYCHAIN_ACCOUNT="pat"   # pre-0.4 single-token storage; migrated on first use
 BASE_URL="${SQUIRRELSTACK_URL:-https://squirrelstack.app}"
@@ -1068,6 +1068,368 @@ cmd_tickets_show() {
   '
 }
 
+# --- Projects: epics and stories ---
+
+# Builds a JSON object from "key type value" triples. type is s (string),
+# n (number) or null. Used so titles and descriptions are escaped properly.
+json_object() {
+  ruby -rjson -e '
+    h = {}
+    ARGV.each_slice(3) do |k, t, v|
+      h[k] = case t
+             when "n" then v.include?(".") ? v.to_f : v.to_i
+             when "null" then nil
+             else v
+             end
+    end
+    puts h.to_json
+  ' -- "$@"
+}
+
+# Appends a --flag value pair to the triple list, mapping "none" to null for ids.
+# Usage: json_fields+=( $(json_triple key type value) ) is awkward with spaces,
+# so callers push onto the array directly.
+pretty_json() { ruby -rjson -e 'puts JSON.pretty_generate(JSON.parse(STDIN.read))'; }
+
+cmd_epics_list() {
+  load_token
+  resolve_account
+
+  local bucket="" owner="" query="limit=100"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --bucket) bucket="$2"; shift 2 ;;
+      --owner)  owner="$2"; shift 2 ;;
+      --json)   JSON_OUTPUT=1; shift ;;
+      *)        die "Unknown option: $1" ;;
+    esac
+  done
+
+  [[ -n "$bucket" ]] && query="${query}&priority_bucket=${bucket}"
+  [[ -n "$owner" ]] && query="${query}&owner_id=${owner}"
+
+  local response
+  response=$(api_get "/epics?${query}")
+
+  if [[ "${JSON_OUTPUT:-}" == "1" ]]; then
+    echo "$response" | pretty_json
+    return
+  fi
+
+  echo "$response" | ruby -rjson -e '
+    epics = JSON.parse(STDIN.read)["epics"]
+    if epics.empty?
+      puts "No epics found."
+      exit
+    end
+
+    printf "%-6s  %-8s  %-12s  %7s  %-16s  %s\n", "ID", "BUCKET", "THEME", "STORIES", "OWNER", "TITLE"
+    printf "%s\n", "-" * 90
+    epics.each do |e|
+      printf "%-6s  %-8s  %-12s  %7s  %-16s  %s\n",
+        e["id"], e["priority_bucket"], e["theme"].to_s[0..11], e["stories_count"],
+        e.dig("owner", "name").to_s[0..15], e["title"]
+    end
+    puts
+    puts "#{epics.length} epic(s). Use: squirrelstack epics show <ID> for details."
+  '
+}
+
+cmd_epics_show() {
+  load_token
+  resolve_account
+
+  local epic_id="${1:-}"
+  [[ -n "$epic_id" ]] || die "Usage: squirrelstack epics show <ID>"
+
+  local response
+  response=$(api_get "/epics/${epic_id}")
+
+  if [[ "${2:-}" == "--json" ]]; then
+    echo "$response" | pretty_json
+    return
+  fi
+
+  echo "$response" | ruby -rjson -e '
+    e = JSON.parse(STDIN.read)["epic"]
+    puts "=" * 80
+    puts e["title"]
+    puts "=" * 80
+    puts
+    puts "ID:        #{e["id"]}"
+    puts "Bucket:    #{e["priority_bucket"]}"
+    puts "Theme:     #{e["theme"] || "(none)"}"
+    puts "Owner:     #{e.dig("owner", "name") || "(unassigned)"}"
+    puts "Planned:   #{e["start_date"] || "?"} to #{e["end_date"] || "?"}"
+    puts "Actual:    #{e["actual_start_date"] || "?"} to #{e["actual_end_date"] || "?"}"
+    puts
+
+    if e["description"] && !e["description"].empty?
+      puts "DESCRIPTION"
+      puts "-" * 80
+      puts e["description"]
+      puts
+    end
+
+    stories = e["stories"] || []
+    puts "STORIES (#{stories.length})"
+    puts "-" * 80
+    if stories.empty?
+      puts "(none)"
+    else
+      printf "%-6s  %-8s  %5s  %-16s  %s\n", "ID", "STATUS", "PTS", "OWNER", "TITLE"
+      stories.each do |s|
+        printf "%-6s  %-8s  %5s  %-16s  %s\n", s["id"], s["status"], s["story_points"], s.dig("owner", "name").to_s[0..15], s["title"]
+      end
+    end
+    puts
+
+    notes = e["notes"] || []
+    unless notes.empty?
+      puts "NOTES (#{notes.length})"
+      puts "-" * 80
+      notes.each { |n| puts "[#{n["created_at"]}] #{n["user"]}: #{n["body"]}" }
+      puts
+    end
+  '
+}
+
+# Parses the shared epic options into JSON triples. Sets EPIC_FIELDS.
+parse_epic_options() {
+  EPIC_FIELDS=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --title)       EPIC_FIELDS+=(title s "$2"); shift 2 ;;
+      --description) EPIC_FIELDS+=(description s "$2"); shift 2 ;;
+      --bucket)      EPIC_FIELDS+=(priority_bucket s "$2"); shift 2 ;;
+      --theme)       EPIC_FIELDS+=(theme s "$2"); shift 2 ;;
+      --owner)
+        if [[ "$2" == "none" ]]; then EPIC_FIELDS+=(owner_id null ""); else EPIC_FIELDS+=(owner_id n "$2"); fi
+        shift 2 ;;
+      --start)       EPIC_FIELDS+=(start_date s "$2"); shift 2 ;;
+      --end)         EPIC_FIELDS+=(end_date s "$2"); shift 2 ;;
+      --position)    EPIC_FIELDS+=(position n "$2"); shift 2 ;;
+      *)             die "Unknown option: $1" ;;
+    esac
+  done
+}
+
+print_epic_summary() {
+  ruby -rjson -e '
+    e = JSON.parse(STDIN.read)["epic"]
+    puts "#{ARGV[0]} epic #{e["id"]}: #{e["title"]}"
+    puts "  Bucket:  #{e["priority_bucket"]}"
+    puts "  Theme:   #{e["theme"] || "(none)"}"
+    puts "  Owner:   #{e.dig("owner", "name") || "(unassigned)"}"
+    puts "  Stories: #{e["stories_count"]}"
+  ' -- "$1"
+}
+
+cmd_epics_create() {
+  load_token
+  resolve_account
+
+  local title="${1:-}"
+  [[ -n "$title" && "$title" != --* ]] || die "Usage: squirrelstack epics create <title> [--bucket ...] [--theme ...] [--owner ...]"
+  shift
+
+  parse_epic_options "$@"
+  EPIC_FIELDS+=(title s "$title")
+
+  local body response
+  body=$(json_object "${EPIC_FIELDS[@]}")
+  response=$(api_post "/epics" -d "$body")
+  echo "$response" | print_epic_summary "Created"
+}
+
+cmd_epics_update() {
+  load_token
+  resolve_account
+
+  local epic_id="${1:-}"
+  [[ -n "$epic_id" ]] || die "Usage: squirrelstack epics update <ID> [--title ...] [--bucket ...] [--owner ...]"
+  shift
+
+  parse_epic_options "$@"
+  [[ ${#EPIC_FIELDS[@]} -gt 0 ]] || die "No updates specified. See: squirrelstack help"
+
+  local body response
+  body=$(json_object "${EPIC_FIELDS[@]}")
+  response=$(api_patch "/epics/${epic_id}" -d "$body")
+  echo "$response" | print_epic_summary "Updated"
+}
+
+cmd_stories_list() {
+  load_token
+  resolve_account
+
+  local status="" epic="" owner="" query="limit=100"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --status) status="$2"; shift 2 ;;
+      --epic)   epic="$2"; shift 2 ;;
+      --owner)  owner="$2"; shift 2 ;;
+      --json)   JSON_OUTPUT=1; shift ;;
+      *)        die "Unknown option: $1" ;;
+    esac
+  done
+
+  [[ -n "$status" ]] && query="${query}&status=${status}"
+  [[ -n "$epic" ]] && query="${query}&epic_id=${epic}"
+  [[ -n "$owner" ]] && query="${query}&owner_id=${owner}"
+
+  local response
+  response=$(api_get "/stories?${query}")
+
+  if [[ "${JSON_OUTPUT:-}" == "1" ]]; then
+    echo "$response" | pretty_json
+    return
+  fi
+
+  echo "$response" | ruby -rjson -e '
+    stories = JSON.parse(STDIN.read)["stories"]
+    if stories.empty?
+      puts "No stories found."
+      exit
+    end
+
+    printf "%-6s  %-8s  %5s  %-24s  %-16s  %s\n", "ID", "STATUS", "PTS", "EPIC", "OWNER", "TITLE"
+    printf "%s\n", "-" * 100
+    stories.each do |s|
+      printf "%-6s  %-8s  %5s  %-24s  %-16s  %s\n",
+        s["id"], s["status"], s["story_points"], s.dig("epic", "title").to_s[0..23],
+        s.dig("owner", "name").to_s[0..15], s["title"]
+    end
+    puts
+    puts "#{stories.length} story(ies). Use: squirrelstack stories show <ID> for details."
+  '
+}
+
+cmd_stories_show() {
+  load_token
+  resolve_account
+
+  local story_id="${1:-}"
+  [[ -n "$story_id" ]] || die "Usage: squirrelstack stories show <ID>"
+
+  local response
+  response=$(api_get "/stories/${story_id}")
+
+  if [[ "${2:-}" == "--json" ]]; then
+    echo "$response" | pretty_json
+    return
+  fi
+
+  echo "$response" | ruby -rjson -e '
+    s = JSON.parse(STDIN.read)["story"]
+    puts "=" * 80
+    puts s["title"]
+    puts "=" * 80
+    puts
+    puts "ID:         #{s["id"]}"
+    puts "Epic:       #{s.dig("epic", "title")} (#{s.dig("epic", "id")})"
+    puts "Status:     #{s["status"]}"
+    puts "Points:     #{s["story_points"]}"
+    puts "Owner:      #{s.dig("owner", "name") || "(unassigned)"}"
+    puts "Started:    #{s["started_at"] || "-"}"
+    puts "Done:       #{s["done_at"] || "-"}"
+    if s["cycle_time"]
+      puts "Cycle time: #{(s["cycle_time"] / 3600.0).round(1)} hours"
+    end
+    puts
+
+    if s["description"] && !s["description"].empty?
+      puts "DESCRIPTION"
+      puts "-" * 80
+      puts s["description"]
+      puts
+    end
+
+    tasks = s["tasks"] || []
+    unless tasks.empty?
+      progress = s["tasks_progress"]
+      puts "TASKS (#{progress["completed"]}/#{progress["total"]})"
+      puts "-" * 80
+      tasks.each { |t| puts "[#{t["completed"] ? "x" : " "}] #{t["body"]}" }
+      puts
+    end
+
+    notes = s["notes"] || []
+    unless notes.empty?
+      puts "NOTES (#{notes.length})"
+      puts "-" * 80
+      notes.each { |n| puts "[#{n["created_at"]}] #{n["user"]}: #{n["body"]}" }
+      puts
+    end
+  '
+}
+
+# Parses the shared story options into JSON triples. Sets STORY_FIELDS.
+parse_story_options() {
+  STORY_FIELDS=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --title)       STORY_FIELDS+=(title s "$2"); shift 2 ;;
+      --description) STORY_FIELDS+=(description s "$2"); shift 2 ;;
+      --epic)        STORY_FIELDS+=(epic_id n "$2"); shift 2 ;;
+      --status)      STORY_FIELDS+=(status s "$2"); shift 2 ;;
+      --points)      STORY_FIELDS+=(story_points n "$2"); shift 2 ;;
+      --owner)
+        if [[ "$2" == "none" ]]; then STORY_FIELDS+=(owner_id null ""); else STORY_FIELDS+=(owner_id n "$2"); fi
+        shift 2 ;;
+      --position)    STORY_FIELDS+=(position n "$2"); shift 2 ;;
+      *)             die "Unknown option: $1" ;;
+    esac
+  done
+}
+
+print_story_summary() {
+  ruby -rjson -e '
+    s = JSON.parse(STDIN.read)["story"]
+    puts "#{ARGV[0]} story #{s["id"]}: #{s["title"]}"
+    puts "  Epic:   #{s.dig("epic", "title")} (#{s.dig("epic", "id")})"
+    puts "  Status: #{s["status"]}"
+    puts "  Points: #{s["story_points"]}"
+    puts "  Owner:  #{s.dig("owner", "name") || "(unassigned)"}"
+  ' -- "$1"
+}
+
+cmd_stories_create() {
+  load_token
+  resolve_account
+
+  local title="${1:-}"
+  [[ -n "$title" && "$title" != --* ]] || die "Usage: squirrelstack stories create <title> --epic <ID> [--points ...] [--owner ...]"
+  shift
+
+  parse_story_options "$@"
+  STORY_FIELDS+=(title s "$title")
+
+  local body response
+  body=$(json_object "${STORY_FIELDS[@]}")
+  response=$(api_post "/stories" -d "$body")
+  echo "$response" | print_story_summary "Created"
+}
+
+cmd_stories_update() {
+  load_token
+  resolve_account
+
+  local story_id="${1:-}"
+  [[ -n "$story_id" ]] || die "Usage: squirrelstack stories update <ID> [--status ...] [--points ...] [--owner ...] [--epic ...]"
+  shift
+
+  parse_story_options "$@"
+  [[ ${#STORY_FIELDS[@]} -gt 0 ]] || die "No updates specified. See: squirrelstack help"
+
+  local body response
+  body=$(json_object "${STORY_FIELDS[@]}")
+  response=$(api_patch "/stories/${story_id}" -d "$body")
+  echo "$response" | print_story_summary "Updated"
+}
+
 cmd_help() {
   cat <<'HELP'
 squirrelstack — CLI for SquirrelStack
@@ -1090,6 +1452,14 @@ Usage:
   squirrelstack errors members                    List team members (for --assign)
   squirrelstack tickets [options]                 List open helpdesk tickets
   squirrelstack tickets show <ID>                 Show ticket details with messages
+  squirrelstack epics [options]                   List epics
+  squirrelstack epics show <ID>                   Show an epic with its stories
+  squirrelstack epics create <title> [options]    Create an epic
+  squirrelstack epics update <ID> [options]       Update an epic
+  squirrelstack stories [options]                 List stories
+  squirrelstack stories show <ID>                 Show a story with tasks and notes
+  squirrelstack stories create <title> [options]  Create a story in an epic
+  squirrelstack stories update <ID> [options]     Update or move a story
 
 User selection (in order):
   --user <email>           Flag (highest priority)
@@ -1125,6 +1495,39 @@ Options for 'tickets':
   --json                Output raw JSON
 
 Options for 'tickets show':
+  --json                Output raw JSON
+
+Options for 'epics':
+  --bucket <bucket>     Filter: ongoing, now, next, future, done
+  --owner <user_id>     Filter by owner
+  --json                Output raw JSON
+
+Options for 'epics create' and 'epics update':
+  --title <text>        Epic title (update only; create takes it as the first argument)
+  --description <text>  Longer description
+  --bucket <bucket>     ongoing, now, next, future, done (new epics can't start in now)
+  --theme <label>       Theme label
+  --owner <user_id>     Owner (use 'none' to unassign)
+  --start <date>        Planned start, YYYY-MM-DD
+  --end <date>          Planned end, YYYY-MM-DD
+  --position <n>        Sort position within the bucket
+
+Options for 'stories':
+  --status <status>     Filter: backlog, ready, doing, review, done
+  --epic <epic_id>      Filter by epic
+  --owner <user_id>     Filter by owner
+  --json                Output raw JSON
+
+Options for 'stories create' and 'stories update':
+  --epic <epic_id>      Epic the story belongs to (required on create)
+  --title <text>        Story title (update only; create takes it as the first argument)
+  --description <text>  Longer description
+  --status <status>     backlog, ready, doing, review, done
+  --points <n>          Story points: 0.5, 1, 2, 4, 8
+  --owner <user_id>     Owner (use 'none' to unassign)
+  --position <n>        Sort position within the status column
+
+Options for 'epics show' and 'stories show':
   --json                Output raw JSON
 
 Environment variables:
@@ -1193,6 +1596,24 @@ case "$command" in
     case "$subcommand" in
       show) shift; cmd_tickets_show "$@" ;;
       *)    cmd_tickets_list "$@" ;;
+    esac
+    ;;
+  epics)
+    subcommand="${1:-list}"
+    case "$subcommand" in
+      show)   shift; cmd_epics_show "$@" ;;
+      create) shift; cmd_epics_create "$@" ;;
+      update) shift; cmd_epics_update "$@" ;;
+      *)      cmd_epics_list "$@" ;;
+    esac
+    ;;
+  stories)
+    subcommand="${1:-list}"
+    case "$subcommand" in
+      show)   shift; cmd_stories_show "$@" ;;
+      create) shift; cmd_stories_create "$@" ;;
+      update) shift; cmd_stories_update "$@" ;;
+      *)      cmd_stories_list "$@" ;;
     esac
     ;;
   version|--version|-v) echo "squirrelstack $VERSION" ;;
