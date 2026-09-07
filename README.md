@@ -118,6 +118,11 @@ squirrelstack errors --status all --json
 squirrelstack errors show <ID>
 squirrelstack errors show <ID> --json
 
+# List every occurrence (instance) of an error
+squirrelstack errors occurrences <ID>
+squirrelstack errors occurrences <ID> --limit 500
+squirrelstack errors occurrences <ID> --json
+
 # Update an error
 squirrelstack errors update <ID> --status resolved
 squirrelstack errors update <ID> --priority high

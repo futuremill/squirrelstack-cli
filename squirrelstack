@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="0.5.0"
+VERSION="0.6.0"
 KEYCHAIN_SERVICE="squirrelstack-cli"
 LEGACY_KEYCHAIN_ACCOUNT="pat"   # pre-0.4 single-token storage; migrated on first use
 BASE_URL="${SQUIRRELSTACK_URL:-https://squirrelstack.app}"
@@ -850,6 +850,99 @@ cmd_errors_show() {
   '
 }
 
+cmd_errors_occurrences() {
+  load_token
+  resolve_account
+
+  local error_id="${1:-}"
+  [[ -n "$error_id" ]] || die "Usage: squirrelstack errors occurrences <ID> [--limit N] [--json]"
+  shift
+
+  local json_output=""
+  local max_total=0   # 0 means fetch every occurrence
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --json)   json_output="--json"; shift ;;
+      --limit)  max_total="${2:-}"; shift 2 ;;
+      *)        die "Unknown option: $1" ;;
+    esac
+  done
+
+  [[ "$max_total" =~ ^[0-9]+$ ]] || die "--limit must be a positive integer"
+
+  # Page through the cursor-paginated endpoint, following next_before until
+  # it comes back null, accumulating each page's JSON body (one per line).
+  local before=""
+  local pages=""
+  local fetched=0
+
+  while true; do
+    local page_size=100
+    if [[ "$max_total" -gt 0 ]]; then
+      local remaining=$(( max_total - fetched ))
+      [[ "$remaining" -le 0 ]] && break
+      [[ "$remaining" -lt 100 ]] && page_size="$remaining"
+    fi
+
+    local query="limit=${page_size}"
+    if [[ -n "$before" ]]; then
+      local encoded_before
+      encoded_before=$(ruby -rcgi -e 'print CGI.escape(ARGV[0])' "$before")
+      query="${query}&before=${encoded_before}"
+    fi
+
+    local page
+    page=$(api_get "/errors/${error_id}/occurrences?${query}")
+    pages="${pages}${page}"$'\n'
+
+    local page_count
+    page_count=$(echo "$page" | ruby -rjson -e 'puts JSON.parse(STDIN.read)["occurrences"].length')
+    fetched=$(( fetched + page_count ))
+    [[ "$page_count" -eq 0 ]] && break
+
+    before=$(echo "$page" | ruby -rjson -e 'nb = JSON.parse(STDIN.read)["next_before"]; print nb unless nb.nil?')
+    [[ -z "$before" ]] && break
+  done
+
+  # Merge every page's occurrences into a single array.
+  local merged
+  merged=$(echo "$pages" | ruby -rjson -e '
+    all = []
+    STDIN.read.each_line do |line|
+      line = line.strip
+      next if line.empty?
+      all.concat(JSON.parse(line)["occurrences"] || [])
+    end
+    puts JSON.generate({ "occurrences" => all })
+  ')
+
+  if [[ "$json_output" == "--json" ]]; then
+    echo "$merged" | ruby -rjson -e 'puts JSON.pretty_generate(JSON.parse(STDIN.read))'
+    return
+  fi
+
+  echo "$merged" | ruby -rjson -rtime -e '
+    occs = JSON.parse(STDIN.read)["occurrences"]
+    if occs.empty?
+      puts "No occurrences found."
+    else
+      printf "%-20s  %-6s  %-45s  %-20s  %s\n", "TIME", "METHOD", "URL", "HOST", "USER"
+      printf "%s\n", "-" * 110
+      occs.each do |o|
+        time = o["occurred_at"] ? Time.parse(o["occurred_at"]).strftime("%Y-%m-%d %H:%M:%S") : ""
+        meth = (o["http_method"] || "").to_s[0..5]
+        url = (o["url"] || "").to_s[0..44]
+        host = (o["hostname"] || "").to_s[0..19]
+        user = (o["user_name"] || o["user_id"] || "").to_s
+        printf "%-20s  %-6s  %-45s  %-20s  %s\n", time, meth, url, host, user
+      end
+      puts
+      puts "#{occs.length} occurrence(s). Use --json for full context and backtraces."
+    end
+  '
+}
+
 cmd_errors_update() {
   load_token
   resolve_account
@@ -1447,6 +1540,7 @@ Usage:
   squirrelstack accounts current                  Show resolved account + source
   squirrelstack errors [options]                  List open errors
   squirrelstack errors show <ID>                  Show error details with notes
+  squirrelstack errors occurrences <ID>           List every occurrence (instance) of an error
   squirrelstack errors update <ID> [options]      Update error status/priority/assignee
   squirrelstack errors comment <ID> <message>     Add a note to an error
   squirrelstack errors members                    List team members (for --assign)
@@ -1488,6 +1582,10 @@ Options for 'errors update':
 
 Options for 'errors show':
   --json                Output raw JSON
+
+Options for 'errors occurrences':
+  --limit <N>           Fetch at most N occurrences (default: all)
+  --json                Output raw JSON (includes full context and backtraces)
 
 Options for 'tickets':
   --state <state>       Filter: open (default), new, assigned, closed, all
@@ -1584,11 +1682,12 @@ case "$command" in
   errors)
     subcommand="${1:-list}"
     case "$subcommand" in
-      show)    shift; cmd_errors_show "$@" ;;
-      update)  shift; cmd_errors_update "$@" ;;
-      comment) shift; cmd_errors_comment "$@" ;;
-      members) cmd_errors_members ;;
-      *)       cmd_errors_list "$@" ;;
+      show)        shift; cmd_errors_show "$@" ;;
+      occurrences) shift; cmd_errors_occurrences "$@" ;;
+      update)      shift; cmd_errors_update "$@" ;;
+      comment)     shift; cmd_errors_comment "$@" ;;
+      members)     cmd_errors_members ;;
+      *)           cmd_errors_list "$@" ;;
     esac
     ;;
   tickets)
