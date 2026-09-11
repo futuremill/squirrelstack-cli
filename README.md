@@ -210,7 +210,8 @@ squirrelstack monitors ping nightly-backup
 squirrelstack monitors delete nightly-backup --yes
 ```
 
-Intervals are `1m`, `5m`, `15m`, `30m`, `1h`, `1d` or `1w`. A heartbeat is
+Intervals are `1m`, `5m`, `15m`, `30m`, `1h`, `1d` or `1w`, or for heartbeats any
+number of days such as `95d` (up to 366). A heartbeat is
 marked missed once its interval plus a grace period (10% of the interval,
 minimum 30 seconds) passes without a ping.
 

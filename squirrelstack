@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="0.7.0"
+VERSION="0.7.1"
 KEYCHAIN_SERVICE="squirrelstack-cli"
 LEGACY_KEYCHAIN_ACCOUNT="pat"   # pre-0.4 single-token storage; migrated on first use
 BASE_URL="${SQUIRRELSTACK_URL:-https://squirrelstack.app}"
@@ -1528,9 +1528,12 @@ cmd_stories_update() {
 
 # --- Monitor: uptime checks and heartbeats ---
 
-# Accepts seconds or a shorthand (1m, 5m, 15m, 30m, 1h, 1d, 1w) and prints seconds.
+# Accepts seconds or a shorthand (1m, 5m, 15m, 30m, 1h, 1d, 1w, or Nd for a
+# custom number of days, heartbeats only) and prints seconds.
 interval_to_seconds() {
   case "$1" in
+    *d) [[ "${1%d}" =~ ^[0-9]+$ ]] || die "Unknown interval '$1'. Use one of: 1m, 5m, 15m, 30m, 1h, 1d, 1w, or Nd (e.g. 95d)"
+        echo $(( ${1%d} * 86400 )) ;;
     1m|60)      echo 60 ;;
     5m|300)     echo 300 ;;
     15m|900)    echo 900 ;;
@@ -1538,7 +1541,7 @@ interval_to_seconds() {
     1h|3600)    echo 3600 ;;
     1d|86400)   echo 86400 ;;
     1w|604800)  echo 604800 ;;
-    *) die "Unknown interval '$1'. Use one of: 1m, 5m, 15m, 30m, 1h, 1d, 1w" ;;
+    *) die "Unknown interval '$1'. Use one of: 1m, 5m, 15m, 30m, 1h, 1d, 1w, or Nd (e.g. 95d)" ;;
   esac
 }
 
@@ -1918,7 +1921,8 @@ Options for 'monitors create' and 'monitors update':
   --type <type>         check (we request a URL) or heartbeat (your job pings us); create only
   --name <text>         Monitor name (update only; create takes it as the first argument)
   --url <url>           URL to request (required for check monitors)
-  --interval <period>   1m, 5m, 15m, 30m, 1h, 1d, 1w (default 5m). Heartbeats get a grace
+  --interval <period>   1m, 5m, 15m, 30m, 1h, 1d, 1w, or Nd for heartbeats that run every
+                        N days, e.g. 95d (default 5m). Heartbeats get a grace
                         of 10% of the interval (minimum 30s) before being marked missed.
   --slack on|off        Send Slack alerts when the status changes
   --slack-channel <id>  Slack channel ID override (use 'none' to clear)
