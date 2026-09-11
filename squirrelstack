@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="0.6.0"
+VERSION="0.7.0"
 KEYCHAIN_SERVICE="squirrelstack-cli"
 LEGACY_KEYCHAIN_ACCOUNT="pat"   # pre-0.4 single-token storage; migrated on first use
 BASE_URL="${SQUIRRELSTACK_URL:-https://squirrelstack.app}"
@@ -389,6 +389,8 @@ api_post() {
   shift
   api_request POST "$path" -H "Content-Type: application/json" "$@"
 }
+
+api_delete() { api_request DELETE "$@"; }
 
 # --- PKCE OAuth Login ---
 
@@ -1164,13 +1166,14 @@ cmd_tickets_show() {
 # --- Projects: epics and stories ---
 
 # Builds a JSON object from "key type value" triples. type is s (string),
-# n (number) or null. Used so titles and descriptions are escaped properly.
+# n (number), b (boolean) or null. Used so titles and descriptions are escaped properly.
 json_object() {
   ruby -rjson -e '
     h = {}
     ARGV.each_slice(3) do |k, t, v|
       h[k] = case t
              when "n" then v.include?(".") ? v.to_f : v.to_i
+             when "b" then v == "true"
              when "null" then nil
              else v
              end
@@ -1523,6 +1526,278 @@ cmd_stories_update() {
   echo "$response" | print_story_summary "Updated"
 }
 
+# --- Monitor: uptime checks and heartbeats ---
+
+# Accepts seconds or a shorthand (1m, 5m, 15m, 30m, 1h, 1d, 1w) and prints seconds.
+interval_to_seconds() {
+  case "$1" in
+    1m|60)      echo 60 ;;
+    5m|300)     echo 300 ;;
+    15m|900)    echo 900 ;;
+    30m|1800)   echo 1800 ;;
+    1h|3600)    echo 3600 ;;
+    1d|86400)   echo 86400 ;;
+    1w|604800)  echo 604800 ;;
+    *) die "Unknown interval '$1'. Use one of: 1m, 5m, 15m, 30m, 1h, 1d, 1w" ;;
+  esac
+}
+
+cmd_monitors_list() {
+  load_token
+  resolve_account
+
+  local type="" status="" query="limit=100"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --type)   type="$2"; shift 2 ;;
+      --status) status="$2"; shift 2 ;;
+      --json)   JSON_OUTPUT=1; shift ;;
+      *)        die "Unknown option: $1" ;;
+    esac
+  done
+
+  [[ -n "$type" ]] && query="${query}&monitor_type=${type}"
+  [[ -n "$status" ]] && query="${query}&status=${status}"
+
+  local response
+  response=$(api_get "/monitors?${query}")
+
+  if [[ "${JSON_OUTPUT:-}" == "1" ]]; then
+    echo "$response" | pretty_json
+    return
+  fi
+
+  echo "$response" | ruby -rjson -rtime -e '
+    monitors = JSON.parse(STDIN.read)["monitors"]
+    if monitors.empty?
+      puts "No monitors found."
+      exit
+    end
+
+    def interval(seconds)
+      case seconds
+      when 604800 then "1w"
+      when 86400 then "1d"
+      when 3600 then "1h"
+      else "#{seconds / 60}m"
+      end
+    end
+
+    icons = { "up" => "OK  ", "down" => "DOWN", "unknown" => "?   " }
+
+    printf "%-4s  %-24s  %-9s  %-8s  %-16s  %s\n", "", "SLUG", "TYPE", "INTERVAL", "LAST CHECK", "NAME"
+    printf "%s\n", "-" * 90
+    monitors.each do |m|
+      last = m["last_checked_at"] ? Time.parse(m["last_checked_at"]).localtime.strftime("%Y-%m-%d %H:%M") : "never"
+      printf "%-4s  %-24s  %-9s  %-8s  %-16s  %s\n",
+        icons[m["status"]] || m["status"], m["slug"][0..23], m["monitor_type"], interval(m["interval_seconds"]), last, m["name"]
+    end
+
+    counts = monitors.group_by { |m| m["status"] }.transform_values(&:size)
+    puts
+    puts "#{monitors.length} monitor(s): #{counts.fetch("up", 0)} up, #{counts.fetch("down", 0)} down, #{counts.fetch("unknown", 0)} unknown. Use: squirrelstack monitors show <slug> for details."
+  '
+}
+
+cmd_monitors_show() {
+  load_token
+  resolve_account
+
+  local slug="${1:-}"
+  [[ -n "$slug" ]] || die "Usage: squirrelstack monitors show <slug>"
+
+  local response
+  response=$(api_get "/monitors/${slug}")
+
+  if [[ "${2:-}" == "--json" ]]; then
+    echo "$response" | pretty_json
+    return
+  fi
+
+  echo "$response" | print_monitor_details
+}
+
+print_monitor_details() {
+  ruby -rjson -rtime -e '
+    m = JSON.parse(STDIN.read)["monitor"]
+    def human_interval(seconds)
+      return "#{seconds}s" if seconds < 60
+      return "#{seconds / 60}m" if seconds < 3600
+      return "#{(seconds / 3600.0).round(1).to_s.sub(/\.0$/, "")}h" if seconds < 86400
+      "#{(seconds / 86400.0).round(1).to_s.sub(/\.0$/, "")}d"
+    end
+    fmt = ->(t) { t ? Time.parse(t).localtime.strftime("%Y-%m-%d %H:%M:%S") : "never" }
+
+    puts "=" * 80
+    puts "#{m["name"]}  [#{m["status"].upcase}]"
+    puts "=" * 80
+    puts
+    puts "Slug:        #{m["slug"]}"
+    puts "Type:        #{m["monitor_type"]}"
+    puts "URL:         #{m["url"]}" if m["url"]
+    puts "Interval:    every #{human_interval(m["interval_seconds"])}"
+    puts "Grace:       #{human_interval(m["grace_period_seconds"])} after each expected heartbeat" if m["grace_period_seconds"]
+    puts "Last check:  #{fmt.call(m["last_checked_at"])}"
+    puts "Slack:       #{m["slack_notifications_enabled"] ? "on" : "off"}#{m["slack_channel_name"] ? " (#{m["slack_channel_name"]})" : ""}"
+    puts
+
+    if m["heartbeat_url"]
+      puts "HEARTBEAT"
+      puts "-" * 80
+      puts "curl -X POST #{m["heartbeat_url"]}"
+      puts
+    end
+
+    checks = m["recent_checks"] || []
+    puts "RECENT CHECKS (#{checks.length})"
+    puts "-" * 80
+    if checks.empty?
+      puts "(none)"
+    else
+      printf "%-20s  %-7s  %-6s  %s\n", "TIME", "STATUS", "CODE", "RESPONSE"
+      checks.each do |c|
+        code = c["response_code"] ? c["response_code"].to_s : "-"
+        ms = c["response_time_ms"] ? "#{c["response_time_ms"]}ms" : "-"
+        printf "%-20s  %-7s  %-6s  %s\n", fmt.call(c["checked_at"]), c["status"], code, ms
+      end
+    end
+  '
+}
+
+# Parses the shared monitor options into JSON triples. Sets MONITOR_FIELDS.
+parse_monitor_options() {
+  MONITOR_FIELDS=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --name)     MONITOR_FIELDS+=(name s "$2"); shift 2 ;;
+      --type)     MONITOR_FIELDS+=(monitor_type s "$2"); shift 2 ;;
+      --url)      MONITOR_FIELDS+=(url s "$2"); shift 2 ;;
+      --interval) MONITOR_FIELDS+=(interval_seconds n "$(interval_to_seconds "$2")"); shift 2 ;;
+      --slack)
+        case "$2" in
+          on)  MONITOR_FIELDS+=(slack_notifications_enabled b true) ;;
+          off) MONITOR_FIELDS+=(slack_notifications_enabled b false) ;;
+          *)   die "--slack must be 'on' or 'off'" ;;
+        esac
+        shift 2 ;;
+      --slack-channel)
+        if [[ "$2" == "none" ]]; then
+          MONITOR_FIELDS+=(slack_channel_id null "" slack_channel_name null "")
+        else
+          MONITOR_FIELDS+=(slack_channel_id s "$2")
+        fi
+        shift 2 ;;
+      *)          die "Unknown option: $1" ;;
+    esac
+  done
+}
+
+print_monitor_summary() {
+  ruby -rjson -e '
+    m = JSON.parse(STDIN.read)["monitor"]
+    def human_interval(seconds)
+      return "#{seconds}s" if seconds < 60
+      return "#{seconds / 60}m" if seconds < 3600
+      return "#{(seconds / 3600.0).round(1).to_s.sub(/\.0$/, "")}h" if seconds < 86400
+      "#{(seconds / 86400.0).round(1).to_s.sub(/\.0$/, "")}d"
+    end
+    puts "#{ARGV[0]} monitor #{m["slug"]}: #{m["name"]}"
+    puts "  Type:      #{m["monitor_type"]}"
+    puts "  URL:       #{m["url"]}" if m["url"]
+    puts "  Interval:  every #{human_interval(m["interval_seconds"])}"
+    puts "  Status:    #{m["status"]}"
+    if m["heartbeat_url"]
+      puts
+      puts "Ping it from your job with:"
+      puts "  curl -X POST #{m["heartbeat_url"]}"
+    end
+  ' -- "$1"
+}
+
+cmd_monitors_create() {
+  load_token
+  resolve_account
+
+  local name="${1:-}"
+  [[ -n "$name" && "$name" != --* ]] || die "Usage: squirrelstack monitors create <name> --type check|heartbeat [--url ...] [--interval ...]"
+  shift
+
+  parse_monitor_options "$@"
+  MONITOR_FIELDS+=(name s "$name")
+
+  local body response
+  body=$(json_object "${MONITOR_FIELDS[@]}")
+  echo "$body" | grep -q '"monitor_type"' || die "--type is required: check (we request a URL) or heartbeat (your job pings us)"
+  response=$(api_post "/monitors" -d "$body")
+  echo "$response" | print_monitor_summary "Created"
+}
+
+cmd_monitors_update() {
+  load_token
+  resolve_account
+
+  local slug="${1:-}"
+  [[ -n "$slug" ]] || die "Usage: squirrelstack monitors update <slug> [--name ...] [--url ...] [--interval ...] [--slack on|off]"
+  shift
+
+  parse_monitor_options "$@"
+  [[ ${#MONITOR_FIELDS[@]} -gt 0 ]] || die "No updates specified. See: squirrelstack help"
+
+  local body response
+  body=$(json_object "${MONITOR_FIELDS[@]}")
+  response=$(api_patch "/monitors/${slug}" -d "$body")
+  echo "$response" | print_monitor_summary "Updated"
+}
+
+cmd_monitors_delete() {
+  load_token
+  resolve_account
+
+  local slug="${1:-}"
+  [[ -n "$slug" ]] || die "Usage: squirrelstack monitors delete <slug> [--yes]"
+  shift
+
+  local confirmed=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -y|--yes) confirmed=1; shift ;;
+      *)        die "Unknown option: $1" ;;
+    esac
+  done
+
+  if [[ "$confirmed" != "1" ]]; then
+    read -rp "Delete monitor '$slug' and all its check logs? [y/N] " answer
+    [[ "$answer" == "y" || "$answer" == "Y" ]] || { echo "Cancelled."; return; }
+  fi
+
+  api_delete "/monitors/${slug}" > /dev/null
+  echo "Deleted monitor $slug."
+}
+
+# Sends a heartbeat for a monitor by hand — useful to confirm a new monitor is
+# wired up, or to mark a manually-run job as done.
+cmd_monitors_ping() {
+  load_token
+  resolve_account
+
+  local slug="${1:-}"
+  [[ -n "$slug" ]] || die "Usage: squirrelstack monitors ping <slug>"
+
+  local url
+  url=$(api_get "/monitors/${slug}" | ruby -rjson -e '
+    m = JSON.parse(STDIN.read)["monitor"]
+    if m["heartbeat_url"].nil?
+      $stderr.puts "Error: #{m["slug"]} is a URL check, not a heartbeat monitor."
+      exit 1
+    end
+    print m["heartbeat_url"]
+  ') || exit 1
+
+  curl -sS -f -X POST "$url" > /dev/null || die "Heartbeat request to $url failed."
+  echo "Heartbeat sent for $slug."
+}
+
 cmd_help() {
   cat <<'HELP'
 squirrelstack — CLI for SquirrelStack
@@ -1554,6 +1829,12 @@ Usage:
   squirrelstack stories show <ID>                 Show a story with tasks and notes
   squirrelstack stories create <title> [options]  Create a story in an epic
   squirrelstack stories update <ID> [options]     Update or move a story
+  squirrelstack monitors [options]                List uptime monitors with their status
+  squirrelstack monitors show <slug>              Show a monitor with its recent checks
+  squirrelstack monitors create <name> [options]  Create a URL check or heartbeat monitor
+  squirrelstack monitors update <slug> [options]  Update a monitor
+  squirrelstack monitors delete <slug> [--yes]    Delete a monitor and its check logs
+  squirrelstack monitors ping <slug>              Send a heartbeat for a monitor by hand
 
 User selection (in order):
   --user <email>           Flag (highest priority)
@@ -1626,6 +1907,23 @@ Options for 'stories create' and 'stories update':
   --position <n>        Sort position within the status column
 
 Options for 'epics show' and 'stories show':
+  --json                Output raw JSON
+
+Options for 'monitors':
+  --type <type>         Filter: check, heartbeat
+  --status <status>     Filter: up, down, unknown
+  --json                Output raw JSON
+
+Options for 'monitors create' and 'monitors update':
+  --type <type>         check (we request a URL) or heartbeat (your job pings us); create only
+  --name <text>         Monitor name (update only; create takes it as the first argument)
+  --url <url>           URL to request (required for check monitors)
+  --interval <period>   1m, 5m, 15m, 30m, 1h, 1d, 1w (default 5m). Heartbeats get a grace
+                        of 10% of the interval (minimum 30s) before being marked missed.
+  --slack on|off        Send Slack alerts when the status changes
+  --slack-channel <id>  Slack channel ID override (use 'none' to clear)
+
+Options for 'monitors show':
   --json                Output raw JSON
 
 Environment variables:
@@ -1713,6 +2011,17 @@ case "$command" in
       create) shift; cmd_stories_create "$@" ;;
       update) shift; cmd_stories_update "$@" ;;
       *)      cmd_stories_list "$@" ;;
+    esac
+    ;;
+  monitors)
+    subcommand="${1:-list}"
+    case "$subcommand" in
+      show)   shift; cmd_monitors_show "$@" ;;
+      create) shift; cmd_monitors_create "$@" ;;
+      update) shift; cmd_monitors_update "$@" ;;
+      delete) shift; cmd_monitors_delete "$@" ;;
+      ping)   shift; cmd_monitors_ping "$@" ;;
+      *)      cmd_monitors_list "$@" ;;
     esac
     ;;
   version|--version|-v) echo "squirrelstack $VERSION" ;;

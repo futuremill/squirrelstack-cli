@@ -1,6 +1,6 @@
 # SquirrelStack CLI
 
-Command-line tool for [SquirrelStack](https://squirrelstack.app): errors, helpdesk tickets, and project epics and stories.
+Command-line tool for [SquirrelStack](https://squirrelstack.app): errors, helpdesk tickets, project epics and stories, and uptime monitors.
 
 ## Install
 
@@ -182,6 +182,37 @@ squirrelstack stories create "Wire up search" --epic <epic_id> --points 2
 squirrelstack stories update <ID> --status doing --owner <user_id>
 squirrelstack stories update <ID> --status done
 ```
+
+## Monitors
+
+Uptime monitors: URL checks (SquirrelStack requests a URL on a schedule) and
+heartbeats (your job pings a unique URL). Creating, updating and deleting needs
+the Monitor edit permission on your membership.
+
+```bash
+# Status of every monitor, or just a subset
+squirrelstack monitors
+squirrelstack monitors --status down
+squirrelstack monitors --type heartbeat --json
+
+# Show a monitor with its recent checks (and its heartbeat URL)
+squirrelstack monitors show <slug>
+
+# Create a URL check or a heartbeat, then adjust it
+squirrelstack monitors create "API Server" --type check --url https://api.example.com/health --interval 5m
+squirrelstack monitors create "Nightly Backup" --type heartbeat --interval 1d
+squirrelstack monitors update nightly-backup --interval 1w --slack off
+
+# Send a heartbeat by hand, e.g. after running a job manually
+squirrelstack monitors ping nightly-backup
+
+# Delete a monitor and its check logs (asks first unless --yes)
+squirrelstack monitors delete nightly-backup --yes
+```
+
+Intervals are `1m`, `5m`, `15m`, `30m`, `1h`, `1d` or `1w`. A heartbeat is
+marked missed once its interval plus a grace period (10% of the interval,
+minimum 30 seconds) passes without a ping.
 
 ## Environment Variables
 
