@@ -1,6 +1,6 @@
 # SquirrelStack CLI
 
-Command-line tool for [SquirrelStack](https://squirrelstack.app): errors, helpdesk tickets, project epics and stories, and uptime monitors.
+Command-line tool for [SquirrelStack](https://squirrelstack.app): errors, helpdesk tickets, project epics and stories, uptime monitors, and account keys.
 
 ## Install
 
@@ -135,6 +135,27 @@ squirrelstack errors comment <ID> "Root cause identified"
 # List team members (for --assign)
 squirrelstack errors members
 ```
+
+## Account keys
+
+Fetch the account's integration keys without opening the settings pages,
+e.g. when wiring up a new project. The secret key is never returned.
+
+```bash
+# Table of keys and what each is for
+squirrelstack keys
+
+# Just one key, as a bare value for scripts
+squirrelstack keys site      # tracker.js / chat widget site key
+squirrelstack keys errors    # Airbrake project_key for error reporting
+export SQUIRRELSTACK_SITE_KEY=$(squirrelstack keys site)
+
+# Raw JSON
+squirrelstack keys --json
+```
+
+The error tracking key is only returned when the Monitor module is enabled and
+your membership can view it.
 
 ## Helpdesk tickets
 

@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="0.7.1"
+VERSION="0.8.0"
 KEYCHAIN_SERVICE="squirrelstack-cli"
 LEGACY_KEYCHAIN_ACCOUNT="pat"   # pre-0.4 single-token storage; migrated on first use
-BASE_URL="${SQUIRRELSTACK_URL:-https://squirrelstack.app}"
+DEFAULT_BASE_URL="https://squirrelstack.app"
+BASE_URL="${SQUIRRELSTACK_URL:-$DEFAULT_BASE_URL}"
 CLIENT_NAME="SquirrelStack CLI"
 
 # Index of logged-in users (one email per line). Not secret — tokens live in Keychain.
@@ -330,7 +331,13 @@ api_request() {
   body=$(echo "$response" | sed '$d')
 
   if [[ "$http_code" == "401" ]]; then
-    if [[ -z "${SQUIRRELSTACK_TOKEN:-}" ]]; then
+    if [[ -n "${SQUIRRELSTACK_TOKEN:-}" ]]; then
+      echo "Token (SQUIRRELSTACK_TOKEN) is invalid or expired." >&2
+    elif [[ "$BASE_URL" != "$DEFAULT_BASE_URL" ]]; then
+      # A Keychain token is for the real service; a 401 from another server
+      # (e.g. a local dev instance) says nothing about it, so keep it.
+      echo "Token was rejected by $BASE_URL. Keeping the Keychain login, which is for $DEFAULT_BASE_URL." >&2
+    else
       echo "Token is invalid or expired. Removing from Keychain." >&2
       if [[ -n "$USER_EMAIL" ]]; then
         keychain_delete_for "$USER_EMAIL"
@@ -338,8 +345,6 @@ api_request() {
       else
         keychain_delete_for "$LEGACY_KEYCHAIN_ACCOUNT"
       fi
-    else
-      echo "Token (SQUIRRELSTACK_TOKEN) is invalid or expired." >&2
     fi
     die "Please run 'squirrelstack login' to re-authenticate."
   fi
@@ -680,6 +685,54 @@ cmd_accounts_current() {
   else
     echo "(none — server will use default if you have exactly one account)"
   fi
+}
+
+# Fetches /api/v1/keys. With no argument prints a table; "site" or "errors"
+# prints the bare key so it can be captured in scripts.
+cmd_keys() {
+  load_token
+  resolve_account
+
+  local which=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      site|errors) which="$1"; shift ;;
+      --json)      JSON_OUTPUT=1; shift ;;
+      *)           die "Unknown option: $1. Usage: squirrelstack keys [site|errors] [--json]" ;;
+    esac
+  done
+
+  local response
+  response=$(api_get "/keys")
+
+  if [[ "${JSON_OUTPUT:-}" == "1" ]]; then
+    echo "$response" | ruby -rjson -e 'puts JSON.pretty_generate(JSON.parse(STDIN.read))'
+    return
+  fi
+
+  echo "$response" | WHICH="$which" ruby -rjson -e '
+    data = JSON.parse(STDIN.read)
+    site = data["site_key"]
+    errors = data["error_tracking_key"]
+
+    case ENV["WHICH"]
+    when "site"
+      puts site
+    when "errors"
+      if errors.nil?
+        $stderr.puts "Error tracking key not available: the Monitor module is disabled or your membership cannot view it."
+        exit 1
+      end
+      puts errors
+    else
+      printf "%-15s  %-46s  %s\n", "KEY", "VALUE", "USED FOR"
+      printf "%s\n", "-" * 100
+      printf "%-15s  %-46s  %s\n", "site", site, "tracker.js and chat widget snippets"
+      printf "%-15s  %-46s  %s\n", "error tracking", errors || "(not available)", "Airbrake project_key for error reporting"
+      puts
+      puts "Account: #{data.dig("account", "slug")} (#{data.dig("account", "name")})"
+    end
+  '
 }
 
 cmd_errors_list() {
@@ -1816,6 +1869,7 @@ Usage:
   squirrelstack accounts use <slug> [-g]          Pin account for cwd (or globally with -g)
   squirrelstack accounts use --clear [-g]         Remove the pinned account
   squirrelstack accounts current                  Show resolved account + source
+  squirrelstack keys [site|errors] [--json]       Show the account's site and error tracking keys
   squirrelstack errors [options]                  List open errors
   squirrelstack errors show <ID>                  Show error details with notes
   squirrelstack errors occurrences <ID>           List every occurrence (instance) of an error
@@ -1852,6 +1906,10 @@ Account selection (in order):
   ./.squirrelstack         Walked up from cwd (account=<slug>)
   ~/.squirrelstack         Global default
   (server default)         Used when your user has exactly one account
+
+Options for 'keys':
+  site | errors         Print just that key (bare value, for scripts)
+  --json                Output raw JSON
 
 Options for 'errors':
   --status <status>     Filter: unresolved (default), resolved, ignored, all
@@ -1981,6 +2039,7 @@ case "$command" in
       *)       die "Unknown accounts subcommand: $subcommand. Try: list, use, current" ;;
     esac
     ;;
+  keys)          cmd_keys "$@" ;;
   errors)
     subcommand="${1:-list}"
     case "$subcommand" in
