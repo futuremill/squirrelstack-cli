@@ -204,6 +204,9 @@ squirrelstack stories update <ID> --status doing --owner <user_id>
 squirrelstack stories update <ID> --status done
 ```
 
+Story points must be one of 0.5, 1, 2, 4 or 8. Story numbers are shown on the
+board and each story's page in SquirrelStack; click one to copy it.
+
 ## Monitors
 
 Uptime monitors: URL checks (SquirrelStack requests a URL on a schedule) and
@@ -235,6 +238,13 @@ Intervals are `1m`, `5m`, `15m`, `30m`, `1h`, `1d` or `1w`, or for heartbeats an
 number of days such as `95d` (up to 366). A heartbeat is
 marked missed once its interval plus a grace period (10% of the interval,
 minimum 30 seconds) passes without a ping.
+
+## Rate limits
+
+The API allows 120 requests a minute per token for errors, tickets, epics,
+stories and monitors, and 30 a minute for keys. When a limit is reached the CLI
+waits as long as the API asks (at most a minute) and retries once, then fails
+with the API's message.
 
 ## Environment Variables
 

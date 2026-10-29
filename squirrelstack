@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="0.8.0"
+VERSION="0.8.1"
 KEYCHAIN_SERVICE="squirrelstack-cli"
 LEGACY_KEYCHAIN_ACCOUNT="pat"   # pre-0.4 single-token storage; migrated on first use
 DEFAULT_BASE_URL="https://squirrelstack.app"
@@ -323,12 +323,23 @@ api_request() {
     headers+=( -H "X-Account-Slug: $ACCOUNT_SLUG" )
   fi
 
-  local response
-  response=$(curl -sS -w "\n%{http_code}" -X "$method" "${headers[@]}" "$url" "$@" 2>&1) || die "Request failed: $response"
+  local response http_code body attempt retry_after
+  for attempt in 1 2; do
+    response=$(curl -sS -w "\n%{http_code}" -X "$method" "${headers[@]}" "$url" "$@" 2>&1) || die "Request failed: $response"
 
-  local http_code body
-  http_code=$(echo "$response" | tail -1)
-  body=$(echo "$response" | sed '$d')
+    http_code=$(echo "$response" | tail -1)
+    body=$(echo "$response" | sed '$d')
+
+    # Rate limited: the server refused the request before acting on it, so it
+    # is safe to repeat. Wait as long as it says (Retry-After, echoed in the
+    # JSON body) and try once more.
+    [[ "$http_code" == "429" && "$attempt" == 1 ]] || break
+    retry_after=$(echo "$body" | ruby -rjson -e 'puts JSON.parse(STDIN.read)["retry_after"].to_i rescue puts 0' 2>/dev/null)
+    [[ "$retry_after" =~ ^[0-9]+$ && "$retry_after" -gt 0 ]] || retry_after=60
+    (( retry_after > 65 )) && retry_after=65
+    echo "Rate limited by the API. Retrying in ${retry_after}s..." >&2
+    sleep "$retry_after"
+  done
 
   if [[ "$http_code" == "401" ]]; then
     if [[ -n "${SQUIRRELSTACK_TOKEN:-}" ]]; then
@@ -372,6 +383,12 @@ api_request() {
       echo "(account selected via $ACCOUNT_SOURCE)"
     } >&2
     exit 1
+  fi
+
+  if [[ "$http_code" == "429" ]]; then
+    local message
+    message=$(echo "$body" | ruby -rjson -e 'puts JSON.parse(STDIN.read)["error"]' 2>/dev/null)
+    die "API rate limit reached, even after waiting. ${message:-Try again in a minute.}"
   fi
 
   if [[ "$http_code" -ge 400 ]]; then
