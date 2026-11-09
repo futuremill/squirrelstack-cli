@@ -1,6 +1,6 @@
 # SquirrelStack CLI
 
-Command-line tool for [SquirrelStack](https://squirrelstack.app): errors, helpdesk tickets, project epics and stories, uptime monitors, and account keys.
+Command-line tool for [SquirrelStack](https://squirrelstack.app): errors, helpdesk tickets and emails, project epics and stories, uptime monitors, and account keys.
 
 ## Install
 
@@ -170,6 +170,28 @@ squirrelstack tickets --json
 squirrelstack tickets show <ID>
 squirrelstack tickets show <ID> --json
 ```
+
+## Helpdesk emails
+
+Start a conversation by emailing someone outside the account, from one of its
+helpdesk addresses. It goes out as you, through the account's verified sending
+domain, and the reply threads back into the same conversation. Needs the
+Helpdesk edit permission on your membership.
+
+```bash
+squirrelstack emails send --from hello@example.com --to someone@example.org \
+  --name "Sam Someone" --subject "Your open data feed" --message "Hi Sam, ..."
+
+# Longer messages from a file, or '-' for stdin
+squirrelstack emails send --from hello@example.com --to someone@example.org \
+  --subject "Your open data feed" --message-file draft.txt
+```
+
+It prints the conversation ID; follow the thread with
+`squirrelstack tickets show <ID>`. The email is queued when the command
+returns, and its delivery status shows on the conversation.
+
+An agent using the CLI should only run this after you've approved the message.
 
 ## Projects
 

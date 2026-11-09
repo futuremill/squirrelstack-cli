@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="0.8.1"
+VERSION="0.9.0"
 KEYCHAIN_SERVICE="squirrelstack-cli"
 LEGACY_KEYCHAIN_ACCOUNT="pat"   # pre-0.4 single-token storage; migrated on first use
 DEFAULT_BASE_URL="https://squirrelstack.app"
@@ -1237,6 +1237,65 @@ cmd_tickets_show() {
 
 # Builds a JSON object from "key type value" triples. type is s (string),
 # n (number), b (boolean) or null. Used so titles and descriptions are escaped properly.
+# Starts a helpdesk conversation by emailing someone outside the account, from
+# one of its helpdesk addresses (POST /api/v1/helpdesk/emails). Sent as you;
+# the reply threads back into the same conversation.
+cmd_emails_send() {
+  load_token
+  resolve_account
+
+  local from="" to="" name="" subject="" message="" message_file="" priority="" message_given=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --from)         from="$2"; shift 2 ;;
+      --to)           to="$2"; shift 2 ;;
+      --name)         name="$2"; shift 2 ;;
+      --subject)      subject="$2"; shift 2 ;;
+      --message)      message="$2"; message_given=1; shift 2 ;;
+      --message-file) message_file="$2"; shift 2 ;;
+      --priority)     priority="$2"; shift 2 ;;
+      --json)         JSON_OUTPUT=1; shift ;;
+      *)              die "Unknown option: $1" ;;
+    esac
+  done
+
+  local usage="Usage: squirrelstack emails send --from <address> --to <address> [--name <name>] --subject <subject> (--message <text> | --message-file <path|->)"
+  [[ -n "$from" && -n "$to" && -n "$subject" ]] || die "$usage"
+  [[ -n "$message_given" && -n "$message_file" ]] && die "Use --message or --message-file, not both"
+
+  if [[ -n "$message_file" ]]; then
+    if [[ "$message_file" == "-" ]]; then
+      message=$(cat)
+    else
+      [[ -r "$message_file" ]] || die "Can't read $message_file"
+      message=$(cat -- "$message_file")
+    fi
+  fi
+  [[ -n "$message" ]] || die "$usage"
+
+  local -a fields=( from s "$from" to s "$to" subject s "$subject" message s "$message" )
+  [[ -n "$name" ]] && fields+=( name s "$name" )
+  [[ -n "$priority" ]] && fields+=( priority s "$priority" )
+
+  local body response
+  body=$(json_object "${fields[@]}")
+  response=$(api_post "/helpdesk/emails" -d "$body")
+
+  if [[ "${JSON_OUTPUT:-}" == "1" ]]; then
+    echo "$response" | pretty_json
+    return
+  fi
+
+  echo "$response" | ruby -rjson -e '
+    c = JSON.parse(STDIN.read)
+    puts "Queued email in conversation #{c["conversation_id"]}: #{c["subject"]}"
+    puts "  From: #{c["from"]}"
+    puts "  To:   #{c["to"]}"
+    puts "Follow it with: squirrelstack tickets show #{c["conversation_id"]}"
+  '
+}
+
 json_object() {
   ruby -rjson -e '
     h = {}
@@ -1895,6 +1954,7 @@ Usage:
   squirrelstack errors members                    List team members (for --assign)
   squirrelstack tickets [options]                 List open helpdesk tickets
   squirrelstack tickets show <ID>                 Show ticket details with messages
+  squirrelstack emails send [options]             Email someone from a helpdesk address
   squirrelstack epics [options]                   List epics
   squirrelstack epics show <ID>                   Show an epic with its stories
   squirrelstack epics create <title> [options]    Create an epic
@@ -1952,6 +2012,16 @@ Options for 'tickets':
   --json                Output raw JSON
 
 Options for 'tickets show':
+  --json                Output raw JSON
+
+Options for 'emails send':
+  --from <address>      One of the account's helpdesk addresses (required)
+  --to <address>        Recipient email address (required)
+  --name <name>         Recipient name, used if they aren't a contact yet
+  --subject <subject>   Subject line (required)
+  --message <text>      Message body, or:
+  --message-file <path> Read the body from a file ('-' for stdin)
+  --priority <level>    urgent, high, normal or low
   --json                Output raw JSON
 
 Options for 'epics':
@@ -2073,6 +2143,13 @@ case "$command" in
     case "$subcommand" in
       show) shift; cmd_tickets_show "$@" ;;
       *)    cmd_tickets_list "$@" ;;
+    esac
+    ;;
+  emails)
+    subcommand="${1:-}"
+    case "$subcommand" in
+      send) shift; cmd_emails_send "$@" ;;
+      *)    die "Usage: squirrelstack emails send [options]. Run: squirrelstack help" ;;
     esac
     ;;
   epics)
