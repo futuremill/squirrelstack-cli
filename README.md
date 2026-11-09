@@ -166,9 +166,40 @@ squirrelstack tickets --state closed
 squirrelstack tickets --state all --priority urgent
 squirrelstack tickets --json
 
-# View a ticket with its full message thread
+# Search, or one contact's tickets, or those with a draft waiting
+squirrelstack tickets --search "invoice" --state all
+squirrelstack tickets --contact bob@example.com
+squirrelstack tickets --drafts
+
+# View a ticket with its full message thread (drafts are marked with their ID)
 squirrelstack tickets show <ID>
 squirrelstack tickets show <ID> --json
+
+# Reply (sent as you), or save a draft to review in the app
+squirrelstack tickets reply <ID> --message "Thanks, that's fixed now."
+squirrelstack tickets reply <ID> --message-file reply.txt --draft
+
+# Internal note, and ticket changes
+squirrelstack tickets note <ID> --message "Customer is on the old plan"
+squirrelstack tickets update <ID> --state closed
+squirrelstack tickets update <ID> --assign <user_id> --priority high   # ids: squirrelstack errors members
+squirrelstack tickets update <ID> --assign none --priority none
+```
+
+Replying, notes, updates and drafts act as you and need the Helpdesk edit
+permission on your membership.
+
+## Drafts
+
+Replies and emails saved with `--draft` (or "Save draft" in the app) wait on
+the conversation, under Drafts in the help desk, until someone sends them. An
+agent can draft and you can review, edit and send in the app, or here:
+
+```bash
+squirrelstack drafts                         # list drafts waiting
+squirrelstack drafts edit <ID> --message-file better.txt
+squirrelstack drafts send <ID>
+squirrelstack drafts discard <ID> --yes
 ```
 
 ## Helpdesk emails
@@ -185,13 +216,17 @@ squirrelstack emails send --from hello@example.com --to someone@example.org \
 # Longer messages from a file, or '-' for stdin
 squirrelstack emails send --from hello@example.com --to someone@example.org \
   --subject "Your open data feed" --message-file draft.txt
+
+# Save it as a draft to review in the app instead of sending
+squirrelstack emails send --from hello@example.com --to someone@example.org \
+  --subject "Your open data feed" --message-file draft.txt --draft
 ```
 
 It prints the conversation ID; follow the thread with
 `squirrelstack tickets show <ID>`. The email is queued when the command
 returns, and its delivery status shows on the conversation.
 
-An agent using the CLI should only run this after you've approved the message.
+An agent using the CLI should save drafts (`--draft`) for you to review, or only send after you've approved the message.
 
 ## Projects
 

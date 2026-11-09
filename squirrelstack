@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="0.9.0"
+VERSION="0.10.0"
 KEYCHAIN_SERVICE="squirrelstack-cli"
 LEGACY_KEYCHAIN_ACCOUNT="pat"   # pre-0.4 single-token storage; migrated on first use
 DEFAULT_BASE_URL="https://squirrelstack.app"
@@ -1112,12 +1112,15 @@ cmd_tickets_list() {
   resolve_account
 
   local state="open"
-  local priority=""
+  local priority="" search="" contact="" drafts=""
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --state)    state="$2"; shift 2 ;;
       --priority) priority="$2"; shift 2 ;;
+      --search)   search="$2"; shift 2 ;;
+      --contact)  contact="$2"; shift 2 ;;
+      --drafts)   drafts=1; shift ;;
       --json)     JSON_OUTPUT=1; shift ;;
       *)          die "Unknown option: $1" ;;
     esac
@@ -1125,6 +1128,9 @@ cmd_tickets_list() {
 
   local query="state=${state}"
   [[ -n "$priority" ]] && query="${query}&priority=${priority}"
+  [[ -n "$search" ]] && query="${query}&q=$(urlencode "$search")"
+  [[ -n "$contact" ]] && query="${query}&contact=$(urlencode "$contact")"
+  [[ -n "$drafts" ]] && query="${query}&drafts=true"
 
   local response
   response=$(api_get "/tickets?${query}")
@@ -1218,6 +1224,8 @@ cmd_tickets_show() {
 
       label = m["type"]
       label = "email #{m["direction"]}" if m["type"] == "email" && m["direction"]
+      label = "#{label}, #{m["status"].upcase} #{m["id"]}" if m["status"] == "draft"
+      label = "#{label}, #{m["status"]}" if %w[sending failed].include?(m["status"])
 
       puts
       puts "[#{time}] #{author} (#{label})"
@@ -1233,10 +1241,227 @@ cmd_tickets_show() {
   '
 }
 
-# --- Projects: epics and stories ---
+# --- Helpdesk: replies, notes, drafts, ticket changes and emails ---
+# All of these act as you (personal access token) and need Helpdesk edit access.
 
-# Builds a JSON object from "key type value" triples. type is s (string),
-# n (number), b (boolean) or null. Used so titles and descriptions are escaped properly.
+# Reads a message body from --message <text> or --message-file <path|->,
+# given as MSG_TEXT / MSG_FILE / MSG_GIVEN by the caller, into MESSAGE_BODY.
+read_message_body() {
+  local usage="$1"
+  [[ -n "${MSG_GIVEN:-}" && -n "${MSG_FILE:-}" ]] && die "Use --message or --message-file, not both"
+
+  MESSAGE_BODY="${MSG_TEXT:-}"
+  if [[ -n "${MSG_FILE:-}" ]]; then
+    if [[ "$MSG_FILE" == "-" ]]; then
+      MESSAGE_BODY=$(cat)
+    else
+      [[ -r "$MSG_FILE" ]] || die "Can't read $MSG_FILE"
+      MESSAGE_BODY=$(cat -- "$MSG_FILE")
+    fi
+  fi
+  [[ -n "$MESSAGE_BODY" ]] || die "$usage"
+}
+
+print_message_summary() {
+  ruby -rjson -e '
+    m = JSON.parse(STDIN.read)
+    status = m["status"] == "draft" ? "Saved draft" : (m["type"] == "note" ? "Added note" : "Queued reply")
+    ticket = m["ticket_id"] ? " on ticket #{m["ticket_id"]}" : ""
+    puts "#{ARGV[0].empty? ? status : ARGV[0]} #{m["id"]}#{ticket}"
+    puts "  From: #{m["from"]}" if m["from"]
+    puts "  To:   #{m["to"]}" if m["to"]
+  ' -- "${1:-}"
+}
+
+cmd_tickets_reply() {
+  load_token
+  resolve_account
+
+  local ticket_id="${1:-}" draft=""
+  local usage="Usage: squirrelstack tickets reply <ID> (--message <text> | --message-file <path|->) [--draft]"
+  [[ -n "$ticket_id" && "$ticket_id" != --* ]] || die "$usage"
+  shift
+  MSG_TEXT="" MSG_FILE="" MSG_GIVEN=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --message)      MSG_TEXT="$2"; MSG_GIVEN=1; shift 2 ;;
+      --message-file) MSG_FILE="$2"; shift 2 ;;
+      --draft)        draft=1; shift ;;
+      --json)         JSON_OUTPUT=1; shift ;;
+      *)              die "Unknown option: $1" ;;
+    esac
+  done
+  read_message_body "$usage"
+
+  local -a fields=( message s "$MESSAGE_BODY" )
+  [[ -n "$draft" ]] && fields+=( draft b true )
+
+  local response
+  response=$(api_post "/tickets/${ticket_id}/replies" -d "$(json_object "${fields[@]}")")
+
+  if [[ "${JSON_OUTPUT:-}" == "1" ]]; then echo "$response" | pretty_json; return; fi
+  echo "$response" | print_message_summary
+  if [[ -n "$draft" ]]; then
+    echo "Review it in the app, or: squirrelstack drafts send <ID>"
+  fi
+}
+
+cmd_tickets_note() {
+  load_token
+  resolve_account
+
+  local ticket_id="${1:-}"
+  local usage="Usage: squirrelstack tickets note <ID> (--message <text> | --message-file <path|->)"
+  [[ -n "$ticket_id" && "$ticket_id" != --* ]] || die "$usage"
+  shift
+  MSG_TEXT="" MSG_FILE="" MSG_GIVEN=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --message)      MSG_TEXT="$2"; MSG_GIVEN=1; shift 2 ;;
+      --message-file) MSG_FILE="$2"; shift 2 ;;
+      --json)         JSON_OUTPUT=1; shift ;;
+      *)              die "Unknown option: $1" ;;
+    esac
+  done
+  read_message_body "$usage"
+
+  local response
+  response=$(api_post "/tickets/${ticket_id}/notes" -d "$(json_object body s "$MESSAGE_BODY")")
+
+  if [[ "${JSON_OUTPUT:-}" == "1" ]]; then echo "$response" | pretty_json; return; fi
+  echo "$response" | print_message_summary "Added note"
+}
+
+cmd_tickets_update() {
+  load_token
+  resolve_account
+
+  local ticket_id="${1:-}"
+  [[ -n "$ticket_id" && "$ticket_id" != --* ]] || die "Usage: squirrelstack tickets update <ID> [--state open|closed] [--assign <user_id>|none] [--priority <level>|none]"
+  shift
+
+  local -a fields=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --state) fields+=( state s "$2" ); shift 2 ;;
+      --assign)
+        if [[ "$2" == "none" ]]; then fields+=( assignee_id null "" ); else fields+=( assignee_id n "$2" ); fi
+        shift 2 ;;
+      --priority)
+        if [[ "$2" == "none" ]]; then fields+=( priority null "" ); else fields+=( priority s "$2" ); fi
+        shift 2 ;;
+      --json)  JSON_OUTPUT=1; shift ;;
+      *)       die "Unknown option: $1" ;;
+    esac
+  done
+  [[ ${#fields[@]} -gt 0 ]] || die "Nothing to update. Use --state, --assign or --priority."
+
+  local response
+  response=$(api_patch "/tickets/${ticket_id}" -d "$(json_object "${fields[@]}")")
+
+  if [[ "${JSON_OUTPUT:-}" == "1" ]]; then echo "$response" | pretty_json; return; fi
+  echo "$response" | ruby -rjson -e '
+    t = JSON.parse(STDIN.read)["ticket"]
+    puts "Updated ticket #{t["id"]}: #{t["subject"]}"
+    puts "  State:    #{t["state"]}"
+    puts "  Assignee: #{t.dig("assignee", "name") || "(unassigned)"}"
+    puts "  Priority: #{t["priority"] || "(not set)"}"
+  '
+}
+
+cmd_drafts_list() {
+  load_token
+  resolve_account
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --json) JSON_OUTPUT=1; shift ;;
+      *)      die "Unknown option: $1" ;;
+    esac
+  done
+
+  local response
+  response=$(api_get "/helpdesk/drafts")
+
+  if [[ "${JSON_OUTPUT:-}" == "1" ]]; then echo "$response" | pretty_json; return; fi
+  echo "$response" | ruby -rjson -rtime -e '
+    drafts = JSON.parse(STDIN.read)["drafts"]
+    if drafts.empty?
+      puts "No drafts waiting."
+      exit
+    end
+
+    drafts.each do |d|
+      time = Time.parse(d["created_at"]).strftime("%Y-%m-%d %H:%M")
+      puts "Draft #{d["id"]} on ticket #{d["ticket_id"]}: #{d["ticket_subject"]}"
+      puts "  By #{d["author"] || "(unknown)"} at #{time}, to #{d["to"] || "(chat)"}"
+      (d["body"] || "").split("\n").first(3).each { |line| puts "  | #{line}" }
+      puts
+    end
+    puts "#{drafts.length} draft(s). Send with: squirrelstack drafts send <ID>"
+  '
+}
+
+cmd_drafts_edit() {
+  load_token
+  resolve_account
+
+  local draft_id="${1:-}"
+  local usage="Usage: squirrelstack drafts edit <ID> (--message <text> | --message-file <path|->)"
+  [[ -n "$draft_id" && "$draft_id" != --* ]] || die "$usage"
+  shift
+  MSG_TEXT="" MSG_FILE="" MSG_GIVEN=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --message)      MSG_TEXT="$2"; MSG_GIVEN=1; shift 2 ;;
+      --message-file) MSG_FILE="$2"; shift 2 ;;
+      --json)         JSON_OUTPUT=1; shift ;;
+      *)              die "Unknown option: $1" ;;
+    esac
+  done
+  read_message_body "$usage"
+
+  local response
+  response=$(api_patch "/helpdesk/drafts/${draft_id}" -d "$(json_object message s "$MESSAGE_BODY")")
+
+  if [[ "${JSON_OUTPUT:-}" == "1" ]]; then echo "$response" | pretty_json; return; fi
+  echo "$response" | print_message_summary "Updated draft"
+}
+
+cmd_drafts_send() {
+  load_token
+  resolve_account
+
+  local draft_id="${1:-}"
+  [[ -n "$draft_id" ]] || die "Usage: squirrelstack drafts send <ID>"
+
+  local response
+  response=$(api_post "/helpdesk/drafts/${draft_id}/send")
+
+  if [[ "${2:-}" == "--json" ]]; then echo "$response" | pretty_json; return; fi
+  echo "$response" | print_message_summary "Sent draft"
+}
+
+cmd_drafts_discard() {
+  load_token
+  resolve_account
+
+  local draft_id="${1:-}" confirmed="${2:-}"
+  [[ -n "$draft_id" ]] || die "Usage: squirrelstack drafts discard <ID> [--yes]"
+
+  if [[ "$confirmed" != "--yes" ]]; then
+    [[ -t 0 ]] || die "Refusing to discard without --yes when not interactive"
+    read -r -p "Discard draft ${draft_id}? [y/N] " answer
+    [[ "$answer" =~ ^[Yy]$ ]] || { echo "Kept."; return; }
+  fi
+
+  api_delete "/helpdesk/drafts/${draft_id}" >/dev/null
+  echo "Discarded draft ${draft_id}."
+}
+
 # Starts a helpdesk conversation by emailing someone outside the account, from
 # one of its helpdesk addresses (POST /api/v1/helpdesk/emails). Sent as you;
 # the reply threads back into the same conversation.
@@ -1244,7 +1469,8 @@ cmd_emails_send() {
   load_token
   resolve_account
 
-  local from="" to="" name="" subject="" message="" message_file="" priority="" message_given=""
+  local from="" to="" name="" subject="" priority="" draft=""
+  MSG_TEXT="" MSG_FILE="" MSG_GIVEN=""
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -1252,31 +1478,23 @@ cmd_emails_send() {
       --to)           to="$2"; shift 2 ;;
       --name)         name="$2"; shift 2 ;;
       --subject)      subject="$2"; shift 2 ;;
-      --message)      message="$2"; message_given=1; shift 2 ;;
-      --message-file) message_file="$2"; shift 2 ;;
+      --message)      MSG_TEXT="$2"; MSG_GIVEN=1; shift 2 ;;
+      --message-file) MSG_FILE="$2"; shift 2 ;;
       --priority)     priority="$2"; shift 2 ;;
+      --draft)        draft=1; shift ;;
       --json)         JSON_OUTPUT=1; shift ;;
       *)              die "Unknown option: $1" ;;
     esac
   done
 
-  local usage="Usage: squirrelstack emails send --from <address> --to <address> [--name <name>] --subject <subject> (--message <text> | --message-file <path|->)"
+  local usage="Usage: squirrelstack emails send --from <address> --to <address> [--name <name>] --subject <subject> (--message <text> | --message-file <path|->) [--draft]"
   [[ -n "$from" && -n "$to" && -n "$subject" ]] || die "$usage"
-  [[ -n "$message_given" && -n "$message_file" ]] && die "Use --message or --message-file, not both"
+  read_message_body "$usage"
 
-  if [[ -n "$message_file" ]]; then
-    if [[ "$message_file" == "-" ]]; then
-      message=$(cat)
-    else
-      [[ -r "$message_file" ]] || die "Can't read $message_file"
-      message=$(cat -- "$message_file")
-    fi
-  fi
-  [[ -n "$message" ]] || die "$usage"
-
-  local -a fields=( from s "$from" to s "$to" subject s "$subject" message s "$message" )
+  local -a fields=( from s "$from" to s "$to" subject s "$subject" message s "$MESSAGE_BODY" )
   [[ -n "$name" ]] && fields+=( name s "$name" )
   [[ -n "$priority" ]] && fields+=( priority s "$priority" )
+  [[ -n "$draft" ]] && fields+=( draft b true )
 
   local body response
   body=$(json_object "${fields[@]}")
@@ -1289,13 +1507,18 @@ cmd_emails_send() {
 
   echo "$response" | ruby -rjson -e '
     c = JSON.parse(STDIN.read)
-    puts "Queued email in conversation #{c["conversation_id"]}: #{c["subject"]}"
+    verb = c["draft"] ? "Saved draft #{c["message_id"]}" : "Queued email"
+    puts "#{verb} in conversation #{c["conversation_id"]}: #{c["subject"]}"
     puts "  From: #{c["from"]}"
     puts "  To:   #{c["to"]}"
     puts "Follow it with: squirrelstack tickets show #{c["conversation_id"]}"
   '
 }
 
+# --- Projects: epics and stories ---
+
+# Builds a JSON object from "key type value" triples. type is s (string),
+# n (number), b (boolean) or null. Used so titles and descriptions are escaped properly.
 json_object() {
   ruby -rjson -e '
     h = {}
@@ -1954,6 +2177,13 @@ Usage:
   squirrelstack errors members                    List team members (for --assign)
   squirrelstack tickets [options]                 List open helpdesk tickets
   squirrelstack tickets show <ID>                 Show ticket details with messages
+  squirrelstack tickets reply <ID> [options]      Reply to a ticket, or save a draft (--draft)
+  squirrelstack tickets note <ID> [options]       Add an internal note to a ticket
+  squirrelstack tickets update <ID> [options]     Close/reopen, assign or set priority
+  squirrelstack drafts                            List drafts waiting to be sent
+  squirrelstack drafts edit <ID> [options]        Change a draft's text
+  squirrelstack drafts send <ID>                  Send a draft
+  squirrelstack drafts discard <ID> [--yes]       Discard a draft
   squirrelstack emails send [options]             Email someone from a helpdesk address
   squirrelstack epics [options]                   List epics
   squirrelstack epics show <ID>                   Show an epic with its stories
@@ -2009,10 +2239,27 @@ Options for 'errors occurrences':
 Options for 'tickets':
   --state <state>       Filter: open (default), new, assigned, closed, all
   --priority <level>    Filter: urgent, high, normal, low
+  --search <text>       Search subjects and message text
+  --contact <email>     Only this contact's tickets
+  --drafts              Only tickets with a draft waiting
   --json                Output raw JSON
 
 Options for 'tickets show':
   --json                Output raw JSON
+
+Options for 'tickets reply' and 'tickets note':
+  --message <text>      Message body, or:
+  --message-file <path> Read the body from a file ('-' for stdin)
+  --draft               (reply only) Save as a draft to review in the app
+  --json                Output raw JSON
+
+Options for 'tickets update':
+  --state <state>       open or closed
+  --assign <user_id>    Assign to a member (see: squirrelstack errors members); 'none' unassigns
+  --priority <level>    urgent, high, normal, low, or 'none'
+
+Options for 'drafts edit':
+  --message <text> | --message-file <path|->
 
 Options for 'emails send':
   --from <address>      One of the account's helpdesk addresses (required)
@@ -2022,6 +2269,7 @@ Options for 'emails send':
   --message <text>      Message body, or:
   --message-file <path> Read the body from a file ('-' for stdin)
   --priority <level>    urgent, high, normal or low
+  --draft               Save as a draft to review in the app
   --json                Output raw JSON
 
 Options for 'epics':
@@ -2141,8 +2389,21 @@ case "$command" in
   tickets)
     subcommand="${1:-list}"
     case "$subcommand" in
-      show) shift; cmd_tickets_show "$@" ;;
-      *)    cmd_tickets_list "$@" ;;
+      show)   shift; cmd_tickets_show "$@" ;;
+      reply)  shift; cmd_tickets_reply "$@" ;;
+      note)   shift; cmd_tickets_note "$@" ;;
+      update) shift; cmd_tickets_update "$@" ;;
+      *)      cmd_tickets_list "$@" ;;
+    esac
+    ;;
+  drafts)
+    subcommand="${1:-}"
+    case "$subcommand" in
+      edit)    shift; cmd_drafts_edit "$@" ;;
+      send)    shift; cmd_drafts_send "$@" ;;
+      discard) shift; cmd_drafts_discard "$@" ;;
+      list)    shift; cmd_drafts_list "$@" ;;
+      *)       cmd_drafts_list "$@" ;;
     esac
     ;;
   emails)
