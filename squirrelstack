@@ -1339,7 +1339,7 @@ cmd_tickets_update() {
   resolve_account
 
   local ticket_id="${1:-}"
-  [[ -n "$ticket_id" && "$ticket_id" != --* ]] || die "Usage: squirrelstack tickets update <ID> [--state open|closed] [--assign <user_id>|none] [--priority <level>|none]"
+  [[ -n "$ticket_id" && "$ticket_id" != --* ]] || die "Usage: squirrelstack tickets update <ID> [--state open|waiting|closed] [--assign <user_id>|none] [--priority <level>|none]"
   shift
 
   local -a fields=()

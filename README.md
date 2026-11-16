@@ -182,6 +182,7 @@ squirrelstack tickets reply <ID> --message-file reply.txt --draft
 # Internal note, and ticket changes
 squirrelstack tickets note <ID> --message "Customer is on the old plan"
 squirrelstack tickets update <ID> --state closed
+squirrelstack tickets update <ID> --state waiting   # replied, waiting for them (unassigned)
 squirrelstack tickets update <ID> --assign <user_id> --priority high   # ids: squirrelstack errors members
 squirrelstack tickets update <ID> --assign none --priority none
 ```
