@@ -18,13 +18,13 @@ chmod +x /usr/local/bin/squirrelstack
 
 ## Requirements
 
-- macOS (uses Keychain for token storage)
+- macOS (keeps tokens in the Keychain and in `~/.config/squirrelstack/tokens/`)
 - Ruby (pre-installed on macOS)
 - curl and openssl (pre-installed on macOS)
 
 ## Authentication
 
-On first use, you'll be prompted to log in via your browser or paste a PAT. Tokens are stored securely in the macOS Keychain.
+On first use, you'll be prompted to log in via your browser or paste a PAT. Tokens are saved in the macOS Keychain and in `~/.config/squirrelstack/tokens/<email>` (readable only by you), as Claude Code keeps `~/.claude/.credentials.json`. The CLI reads the file first, so it works over SSH, in launchd jobs and in terminals with no GUI session, where the Keychain refuses ("User interaction is not allowed"); a token found only in the Keychain is copied to the file the first time it is read from a GUI session. `logout`, and a token the server rejects, remove both.
 
 ```bash
 squirrelstack login     # Authenticate via browser (OAuth)
@@ -35,7 +35,7 @@ squirrelstack whoami    # Show the active user and account
 ## Users
 
 You can be logged in as **multiple users** at once — each `login` stores a
-separate token in the Keychain, keyed by the email reported by the server. The
+separate token (Keychain and token file), keyed by the email reported by the server. The
 CLI picks which user to act as from the following sources, in order:
 
 1. `--user <email>` flag
@@ -308,7 +308,7 @@ with the API's message.
 
 | Variable | Description |
 |---|---|
-| `SQUIRRELSTACK_TOKEN` | PAT token (overrides Keychain) |
+| `SQUIRRELSTACK_TOKEN` | PAT token (overrides the saved logins) |
 | `SQUIRRELSTACK_ACCOUNT` | Account slug to send as `X-Account-Slug` |
 | `SQUIRRELSTACK_URL` | API base URL (default: `https://squirrelstack.app`) |
 

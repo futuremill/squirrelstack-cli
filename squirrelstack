@@ -1,23 +1,27 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="0.10.0"
+VERSION="0.11.0"
 KEYCHAIN_SERVICE="squirrelstack-cli"
 LEGACY_KEYCHAIN_ACCOUNT="pat"   # pre-0.4 single-token storage; migrated on first use
 DEFAULT_BASE_URL="https://squirrelstack.app"
 BASE_URL="${SQUIRRELSTACK_URL:-$DEFAULT_BASE_URL}"
 CLIENT_NAME="SquirrelStack CLI"
 
-# Index of logged-in users (one email per line). Not secret — tokens live in Keychain.
+# Index of logged-in users (one email per line). Not secret; the tokens are kept apart.
 USERS_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/squirrelstack"
 USERS_INDEX="$USERS_DIR/users"
+# One file per user holding their token, readable only by you, beside the Keychain copy: the
+# Keychain can't be read without a GUI session (SSH, launchd jobs, herdr-core terminals say
+# "User interaction is not allowed"), as Claude Code keeps ~/.claude/.credentials.json.
+TOKENS_DIR="$USERS_DIR/tokens"
 
 # Account resolution. Populated by resolve_account(); used by api_request.
 ACCOUNT_SLUG=""
 ACCOUNT_SOURCE=""
 ACCOUNT_FLAG=""
 
-# User resolution. Populated by resolve_user(); selects which Keychain token to use.
+# User resolution. Populated by resolve_user(); selects which saved token to use.
 USER_EMAIL=""
 USER_SOURCE=""
 USER_FLAG=""
@@ -47,7 +51,49 @@ keychain_delete_for() {
   security delete-generic-password -s "$KEYCHAIN_SERVICE" -a "$1" 2>/dev/null || true
 }
 
-# --- User index (logged-in emails; not secret — tokens live in Keychain) ---
+# --- Saved tokens: a file per user, and the Keychain where it can be reached ---
+
+token_file_for() {
+  [[ "$1" != */* && "$1" != .* && -n "$1" ]] || die "Not a user name for a token file: $1"
+  printf '%s/%s' "$TOKENS_DIR" "$1"
+}
+
+# The file first (it works everywhere and never prompts), then the Keychain, copying a token
+# found only there into the file so a later call without a GUI session finds it.
+token_get_for() {
+  local file token
+  file=$(token_file_for "$1")
+  if [[ -s "$file" ]]; then
+    cat "$file"
+    return
+  fi
+  token=$(keychain_get_for "$1")
+  [[ -n "$token" ]] && token_file_write "$1" "$token"
+  printf '%s' "$token"
+}
+
+token_file_write() {
+  local file tmp
+  file=$(token_file_for "$1")
+  (umask 077 && mkdir -p "$TOKENS_DIR")
+  chmod 700 "$TOKENS_DIR"
+  tmp=$(umask 077 && mktemp "$TOKENS_DIR/.token.XXXXXX")
+  printf '%s' "$2" > "$tmp"
+  mv -f "$tmp" "$file"
+}
+
+# Both stores; the Keychain is best-effort, since it refuses without a GUI session.
+token_set_for() {
+  token_file_write "$1" "$2"
+  keychain_set_for "$1" "$2" 2>/dev/null || true
+}
+
+token_delete_for() {
+  rm -f "$(token_file_for "$1")"
+  keychain_delete_for "$1"
+}
+
+# --- User index (logged-in emails; not secret: tokens are kept apart) ---
 
 users_index_list() {
   [[ -f "$USERS_INDEX" ]] && grep -v '^[[:space:]]*$' "$USERS_INDEX" || true
@@ -98,7 +144,7 @@ register_token() {
     end
     puts email
   ') || die "Token verification failed."
-  keychain_set_for "$email" "$token"
+  token_set_for "$email" "$token"
   users_index_add "$email"
   REGISTERED_USER="$email"
 }
@@ -151,7 +197,7 @@ load_token() {
 
   # A user resolved (via flag/env/config/single default) — use their token.
   if [[ -n "$USER_EMAIL" ]]; then
-    TOKEN=$(keychain_get_for "$USER_EMAIL")
+    TOKEN=$(token_get_for "$USER_EMAIL")
     [[ -n "$TOKEN" ]] || die "No saved token for '$USER_EMAIL' (selected via $USER_SOURCE). Run: squirrelstack login"
     return
   fi
@@ -170,7 +216,7 @@ load_token() {
   # Nothing stored at all — first-run interactive setup.
   first_run_setup
   resolve_user
-  TOKEN=$(keychain_get_for "$USER_EMAIL")
+  TOKEN=$(token_get_for "$USER_EMAIL")
   [[ -n "$TOKEN" ]] || die "Token setup failed."
 }
 
@@ -345,13 +391,13 @@ api_request() {
     if [[ -n "${SQUIRRELSTACK_TOKEN:-}" ]]; then
       echo "Token (SQUIRRELSTACK_TOKEN) is invalid or expired." >&2
     elif [[ "$BASE_URL" != "$DEFAULT_BASE_URL" ]]; then
-      # A Keychain token is for the real service; a 401 from another server
+      # A saved token is for the real service; a 401 from another server
       # (e.g. a local dev instance) says nothing about it, so keep it.
-      echo "Token was rejected by $BASE_URL. Keeping the Keychain login, which is for $DEFAULT_BASE_URL." >&2
+      echo "Token was rejected by $BASE_URL. Keeping the saved login, which is for $DEFAULT_BASE_URL." >&2
     else
-      echo "Token is invalid or expired. Removing from Keychain." >&2
+      echo "Token is invalid or expired. Removing the saved login." >&2
       if [[ -n "$USER_EMAIL" ]]; then
-        keychain_delete_for "$USER_EMAIL"
+        token_delete_for "$USER_EMAIL"
         users_index_remove "$USER_EMAIL"
       else
         keychain_delete_for "$LEGACY_KEYCHAIN_ACCOUNT"
@@ -494,7 +540,7 @@ cmd_login() {
   [[ -n "$access_token" ]] || die "No access token received."
 
   register_token "$access_token"
-  echo "Authenticated as $REGISTERED_USER! Token saved to Keychain."
+  echo "Authenticated as $REGISTERED_USER! Token saved."
 }
 
 # --- Commands ---
@@ -518,7 +564,7 @@ cmd_logout() {
     return
   fi
 
-  keychain_delete_for "$email"
+  token_delete_for "$email"
   users_index_remove "$email"
   # Drop a global pin that points at this user so it doesn't dangle.
   [[ "$(read_user_from_file "$HOME/.squirrelstack")" == "$email" ]] && clear_config_key "$HOME/.squirrelstack" user
@@ -2324,12 +2370,14 @@ Options for 'monitors show':
   --json                Output raw JSON
 
 Environment variables:
-  SQUIRRELSTACK_TOKEN     PAT token (overrides Keychain and user selection)
+  SQUIRRELSTACK_TOKEN     PAT token (overrides the saved logins and user selection)
   SQUIRRELSTACK_USER      Email of the logged-in user to use
   SQUIRRELSTACK_ACCOUNT   Account slug to send as X-Account-Slug
   SQUIRRELSTACK_URL       API base URL (default: https://squirrelstack.app)
 
-Tokens are stored securely in macOS Keychain, one per user. You can log in
+Tokens are saved one per user, in macOS Keychain and in
+~/.config/squirrelstack/tokens/ (readable only by you, so the CLI works over
+SSH and in terminals without a GUI session, as Claude Code does). You can log in
 as multiple users and switch between them per directory or globally. On first
 use, you'll be prompted to log in or paste a PAT.
 HELP
