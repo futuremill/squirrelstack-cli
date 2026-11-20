@@ -55,7 +55,11 @@ echo "  SHA256: ${SHA}"
 # Update Homebrew formula
 echo "Updating Homebrew formula..."
 
-FORMULA_DIR=$(mktemp -d)
+# Cloned beside this checkout, not in $TMPDIR: git's signing config for ~/code (the automation
+# key, ~/.gitconfig-code) applies only there, and elsewhere signing goes through 1Password,
+# which fails without a GUI session ("1Password: failed to fill whole buffer", v0.11.0).
+FORMULA_DIR=$(mktemp -d "$(cd .. && pwd)/.homebrew-squirrelstack.XXXXXX")
+trap 'rm -rf "$FORMULA_DIR"' EXIT
 gh repo clone "$HOMEBREW_TAP_REPO" "$FORMULA_DIR" -- -q 2>/dev/null
 
 cat > "${FORMULA_DIR}/Formula/squirrelstack.rb" <<FORMULA
